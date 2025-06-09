@@ -308,14 +308,14 @@ func (i *Instance) Close() error {
 }
 
 func (i *Instance) Preview() (string, error) {
-	if !i.started || i.Status == Paused {
+	if !i.started || i.Status == Paused || i.tmuxSession == nil {
 		return "", nil
 	}
 	return i.tmuxSession.CapturePaneContent()
 }
 
 func (i *Instance) HasUpdated() (updated bool, hasPrompt bool) {
-	if !i.started {
+	if !i.started || i.tmuxSession == nil {
 		return false, false
 	}
 	return i.tmuxSession.HasUpdated()
@@ -323,7 +323,7 @@ func (i *Instance) HasUpdated() (updated bool, hasPrompt bool) {
 
 // TapEnter sends an enter key press to the tmux session if AutoYes is enabled.
 func (i *Instance) TapEnter() {
-	if !i.started || !i.AutoYes {
+	if !i.started || !i.AutoYes || i.tmuxSession == nil {
 		return
 	}
 	if err := i.tmuxSession.TapEnter(); err != nil {
@@ -335,6 +335,9 @@ func (i *Instance) Attach() (chan struct{}, error) {
 	if !i.started {
 		return nil, fmt.Errorf("cannot attach instance that has not been started")
 	}
+	if i.tmuxSession == nil {
+		return nil, fmt.Errorf("tmux session not initialized")
+	}
 	return i.tmuxSession.Attach()
 }
 
@@ -342,6 +345,9 @@ func (i *Instance) SetPreviewSize(width, height int) error {
 	if !i.started || i.Status == Paused {
 		return fmt.Errorf("cannot set preview size for instance that has not been started or " +
 			"is paused")
+	}
+	if i.tmuxSession == nil {
+		return fmt.Errorf("tmux session not initialized")
 	}
 	return i.tmuxSession.SetDetachedSize(width, height)
 }
@@ -374,6 +380,9 @@ func (i *Instance) Paused() bool {
 
 // TmuxAlive returns true if the tmux session is alive. This is a sanity check before attaching.
 func (i *Instance) TmuxAlive() bool {
+	if i.tmuxSession == nil {
+		return false
+	}
 	return i.tmuxSession.DoesSessionExist()
 }
 
