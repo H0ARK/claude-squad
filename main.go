@@ -171,6 +171,9 @@ func main() {
 	// Check for explicit --mcp flag first
 	for _, arg := range os.Args[1:] {
 		if arg == "--mcp" {
+			log.Initialize(true) // Initialize logging for MCP server mode
+			defer log.Close()      // Ensure log file is closed on exit
+
 			// Run as MCP server using mark3labs/mcp-go
 			mcpServer := mcp.CreateMCPServer()
 			if err := server.ServeStdio(mcpServer); err != nil {
