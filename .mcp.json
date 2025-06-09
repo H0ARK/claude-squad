@@ -2,7 +2,7 @@
   "mcpServers": {
     "claude-squad": {
       "command": "/Users/conrad/Documents/github/claude-squad/claude-squad",
-      "args": [],
+      "args": ["--mcp"],
       "env": {}
     }
   }

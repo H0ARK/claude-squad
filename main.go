@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +24,7 @@ var (
 	programFlag string
 	autoYesFlag bool
 	daemonFlag  bool
+	mcpFlag     bool
 	rootCmd     = &cobra.Command{
 		Use:   "claude-squad",
 		Short: "Claude Squad - A terminal-based session manager",
@@ -148,9 +150,14 @@ func init() {
 		"[experimental] If enabled, all instances will automatically accept prompts")
 	rootCmd.Flags().BoolVar(&daemonFlag, "daemon", false, "Run a program that loads all sessions"+
 		" and runs autoyes mode on them.")
+	rootCmd.Flags().BoolVar(&mcpFlag, "mcp", false, "Run as MCP server for Claude Desktop")
 
-	// Hide the daemonFlag as it's only for internal use
+	// Hide the daemonFlag and mcpFlag as they're only for internal use
 	err := rootCmd.Flags().MarkHidden("daemon")
+	if err != nil {
+		panic(err)
+	}
+	err = rootCmd.Flags().MarkHidden("mcp")
 	if err != nil {
 		panic(err)
 	}
@@ -161,16 +168,12 @@ func init() {
 }
 
 func main() {
-	// Check if we're being run as an MCP server (when called by Claude Desktop)
-	// This happens when the program is invoked without any command line arguments
-	// and stdin is connected to a pipe (from Claude Desktop)
-	if len(os.Args) == 1 {
-		// Check if stdin is connected to a pipe (indicating MCP mode)
-		stat, err := os.Stdin.Stat()
-		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
-			// We're being run as an MCP server
-			server := mcp.NewMCPServer()
-			if err := server.Run(); err != nil {
+	// Check for explicit --mcp flag first
+	for _, arg := range os.Args[1:] {
+		if arg == "--mcp" {
+			// Run as MCP server using mark3labs/mcp-go
+			mcpServer := mcp.CreateMCPServer()
+			if err := server.ServeStdio(mcpServer); err != nil {
 				fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 				os.Exit(1)
 			}
