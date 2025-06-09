@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"claude-squad/session"
 	"context"
 	"fmt"
 	"os/exec"
@@ -14,12 +15,13 @@ import (
 
 // Agent management types
 type AgentInfo struct {
-	ID         string    `json:"id"`
-	SessionID  string    `json:"session_id"`
-	Task       string    `json:"task,omitempty"`
-	Status     string    `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastActive time.Time `json:"last_active"`
+	ID         string             `json:"id"`
+	SessionID  string             `json:"session_id"`
+	Task       string             `json:"task,omitempty"`
+	Status     string             `json:"status"`
+	CreatedAt  time.Time          `json:"created_at"`
+	LastActive time.Time          `json:"last_active"`
+	Instance   *session.Instance  `json:"-"` // Reference to claude-squad instance
 }
 
 type AgentManager struct {
@@ -63,7 +65,7 @@ func CreateMCPServer() *server.MCPServer {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		program := request.GetString("program", "claude -p")
+		program := request.GetString("program", "claude")
 
 		result, err := agentManager.launchAgent(task, program)
 		if err != nil {
@@ -143,36 +145,67 @@ func CreateMCPServer() *server.MCPServer {
 		return mcp.NewToolResultText(result), nil
 	})
 
+	// Add send_to_main tool
+	sendToMainTool := mcp.NewTool("send_to_main",
+		mcp.WithDescription("Send agent output to main Claude session"),
+		mcp.WithString("agent_id",
+			mcp.Required(),
+			mcp.Description("ID of the agent to send output from"),
+		),
+	)
+
+	s.AddTool(sendToMainTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		agentID, err := request.RequireString("agent_id")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		err = agentManager.sendOutputToMain(agentID)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Sent output from agent %s to main session", agentID)), nil
+	})
+
 	return s
 }
 
 // Agent management methods
 func (am *AgentManager) launchAgent(task, program string) (string, error) {
-	// Generate unique agent ID
+	// Generate unique agent ID and title
 	agentID := fmt.Sprintf("agent-%d", time.Now().Unix())
-	sessionID := fmt.Sprintf("claude-squad-%s", agentID)
+	title := fmt.Sprintf("Agent-%s", agentID)
 
-	// Create tmux session with task as part of the command
-	// Format: tmux new-session -d -s sessionID claude -p "task"
-	fullCommand := fmt.Sprintf("%s \"%s\"", program, task)
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionID, "sh", "-c", fullCommand)
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to create tmux session: %w", err)
+	// Create new claude-squad instance
+	instance, err := session.NewInstance(session.InstanceOptions{
+		Title:   title,
+		Path:    ".",
+		Program: program,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create instance: %w", err)
+	}
+
+	// Start the instance (this creates the tmux session and shows in UI)
+	if err := instance.Start(true); err != nil {
+		return "", fmt.Errorf("failed to start instance: %w", err)
 	}
 
 	// Store agent info
 	am.mu.Lock()
 	am.agents[agentID] = AgentInfo{
 		ID:         agentID,
-		SessionID:  sessionID,
+		SessionID:  title, // Use title as session identifier
 		Task:       task,
 		Status:     "active",
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
+		Instance:   instance,
 	}
 	am.mu.Unlock()
 
-	return fmt.Sprintf("Agent %s launched successfully in tmux session %s with task: %s", agentID, sessionID, task), nil
+	return fmt.Sprintf("Agent %s launched successfully as claude-squad instance '%s' with task: %s", agentID, title, task), nil
 }
 
 func (am *AgentManager) listAgents() string {
@@ -210,14 +243,25 @@ func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
 		return "", fmt.Errorf("agent %s not found", agentID)
 	}
 
-	// Send message to tmux session using claude --continue (two-step: text first, then enter)
-	continueCommand := fmt.Sprintf("claude -p --continue \"%s\"", message)
-	cmd1 := exec.Command("tmux", "send-keys", "-t", agent.SessionID, continueCommand)
+	if agent.Instance == nil {
+		return "", fmt.Errorf("agent %s has no instance", agentID)
+	}
+
+	// Send message using claude-squad instance tmux session (two-step: text first, then enter)
+	// Access the tmux session directly from the instance
+	if !agent.Instance.Started() {
+		return "", fmt.Errorf("agent %s instance not started", agentID)
+	}
+
+	// Use the instance title as the session name (claude-squad uses title for tmux session names)
+	sessionName := fmt.Sprintf("claudesquad_%s", strings.ReplaceAll(agent.Instance.Title, " ", ""))
+
+	cmd1 := exec.Command("tmux", "send-keys", "-t", sessionName, message)
 	if err := cmd1.Run(); err != nil {
 		return "", fmt.Errorf("failed to send message to agent %s: %w", agentID, err)
 	}
 
-	cmd2 := exec.Command("tmux", "send-keys", "-t", agent.SessionID, "C-m")
+	cmd2 := exec.Command("tmux", "send-keys", "-t", sessionName, "C-m")
 	if err := cmd2.Run(); err != nil {
 		return "", fmt.Errorf("failed to send enter to agent %s: %w", agentID, err)
 	}
@@ -248,4 +292,26 @@ func (am *AgentManager) getAgentOutput(agentID string, lines int) (string, error
 	}
 
 	return fmt.Sprintf("Output from agent %s (last %d lines):\n%s", agentID, lines, string(output)), nil
+}
+
+// Send agent output back to main Claude session
+func (am *AgentManager) sendOutputToMain(agentID string) error {
+	// Get agent output
+	output, err := am.getAgentOutput(agentID, 20)
+	if err != nil {
+		return err
+	}
+
+	// Send to main session (claudesquad_orc)
+	cmd1 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", fmt.Sprintf("Agent %s output: %s", agentID, output))
+	if err := cmd1.Run(); err != nil {
+		return fmt.Errorf("failed to send output to main: %w", err)
+	}
+
+	cmd2 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", "C-m")
+	if err := cmd2.Run(); err != nil {
+		return fmt.Errorf("failed to send enter to main: %w", err)
+	}
+
+	return nil
 }
