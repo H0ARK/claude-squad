@@ -183,6 +183,9 @@ func (m *statusMonitor) hash(s string) []byte {
 
 // TapEnter sends an enter keystroke to the tmux pane.
 func (t *TmuxSession) TapEnter() error {
+	if t.ptmx == nil {
+		return fmt.Errorf("ptmx is nil in TapEnter for session %s (sanitized: %s)", t.Name, t.sanitizedName)
+	}
 	_, err := t.ptmx.Write([]byte{0x0D})
 	if err != nil {
 		return fmt.Errorf("error sending enter keystroke to PTY: %w", err)
@@ -200,6 +203,9 @@ func (t *TmuxSession) TapDAndEnter() error {
 }
 
 func (t *TmuxSession) SendKeys(keys string) error {
+	if t.ptmx == nil {
+		return fmt.Errorf("ptmx is nil in SendKeys for session %s (sanitized: %s)", t.Name, t.sanitizedName)
+	}
 	_, err := t.ptmx.Write([]byte(keys))
 	return err
 }
