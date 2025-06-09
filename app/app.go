@@ -280,19 +280,48 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 
 func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	// If an overlay is active, it should be the only thing that can be updated.
-	if m.textInputOverlay != nil && !m.textInputOverlay.IsSubmitted() && !m.textInputOverlay.IsCanceled() {
-		shouldClose := m.textInputOverlay.HandleKeyPress(msg)
-		if shouldClose {
-			if m.textInputOverlay.IsCanceled() {
-				// Handle cancellation
-				m.list.Kill()
-				m.textInputOverlay = nil
-				m.state = stateDefault
-				m.menu.SetState(ui.StateDefault)
-				return m, m.instanceChanged()
-			} else if m.textInputOverlay.IsSubmitted() {
-				// Handle submission
-				return m.handleNewInstanceSubmit()
+	if m.textInputOverlay != nil {
+		// Check if already submitted/canceled before processing
+		if m.textInputOverlay.IsSubmitted() {
+			return m.handleNewInstanceSubmit()
+		}
+		if m.textInputOverlay.IsCanceled() {
+			m.list.Kill()
+			m.textInputOverlay = nil
+			m.state = stateDefault
+			m.menu.SetState(ui.StateDefault)
+			return m, m.instanceChanged()
+		}
+		
+		// Handle special keys for session naming
+		switch msg.String() {
+		case "enter":
+			// For session naming, Enter should always submit
+			m.textInputOverlay.Submitted = true
+			return m.handleNewInstanceSubmit()
+		case "ctrl+c", "esc":
+			m.textInputOverlay.Canceled = true
+			m.list.Kill()
+			m.textInputOverlay = nil
+			m.state = stateDefault
+			m.menu.SetState(ui.StateDefault)
+			return m, m.instanceChanged()
+		default:
+			// Process other keys normally
+			shouldClose := m.textInputOverlay.HandleKeyPress(msg)
+			if shouldClose {
+				// Check state after processing
+				if m.textInputOverlay.IsCanceled() {
+					// Handle cancellation
+					m.list.Kill()
+					m.textInputOverlay = nil
+					m.state = stateDefault
+					m.menu.SetState(ui.StateDefault)
+					return m, m.instanceChanged()
+				} else if m.textInputOverlay.IsSubmitted() {
+					// Handle submission
+					return m.handleNewInstanceSubmit()
+				}
 			}
 		}
 		return m, nil
