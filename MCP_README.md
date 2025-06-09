@@ -4,40 +4,48 @@ This document explains how to use Claude Squad as a Model Context Protocol (MCP)
 
 ## What is MCP?
 
-Model Context Protocol (MCP) is a standardized protocol that allows AI assistants like Claude to connect to external tools and services. Claude Squad implements an MCP server that provides agent management capabilities through tmux sessions.
+Model Context Protocol (MCP) is a standardized protocol that allows AI assistants like Claude to connect to external tools and services. Claude Squad implements an MCP server using the [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go) library that provides agent management capabilities through tmux sessions.
 
 ## Features
 
 The Claude Squad MCP server provides the following tools:
 
 ### 1. `launch_agent`
+
 Launch a new agent in a tmux session.
 
 **Parameters:**
+
 - `task` (required): Description of the task for the new agent
 - `program` (optional): Program to run (default: "aider")
 
 **Example:**
+
 ```
 Launch an agent to fix the login bug in the authentication module
 ```
 
 ### 2. `list_agents`
+
 List all active agents and their status.
 
 **Parameters:** None
 
 ### 3. `send_message`
+
 Send a message to a specific agent via tmux.
 
 **Parameters:**
+
 - `agent_id` (required): ID of the target agent
 - `message` (required): Message to send to the agent
 
 ### 4. `get_agent_output`
+
 Get recent output from an agent's tmux session.
 
 **Parameters:**
+
 - `agent_id` (required): ID of the agent to get output from
 - `lines` (optional): Number of lines to retrieve (default: 50)
 
@@ -64,7 +72,7 @@ Add the following configuration:
   "mcpServers": {
     "claude-squad": {
       "command": "/absolute/path/to/your/claude-squad",
-      "args": []
+      "args": ["--mcp"]
     }
   }
 }
@@ -81,21 +89,25 @@ Completely quit and restart Claude Desktop for the configuration to take effect.
 Once configured, you can use Claude Squad through Claude Desktop:
 
 ### Launch a New Agent
+
 ```
 Can you launch an agent to refactor the user authentication code?
 ```
 
 ### Check Agent Status
+
 ```
 List all active agents and their current status
 ```
 
 ### Send Commands to an Agent
+
 ```
 Send the message "add unit tests for the login function" to agent-1234567890
 ```
 
 ### Get Agent Output
+
 ```
 Show me the last 20 lines of output from agent-1234567890
 ```
@@ -122,16 +134,19 @@ Claude Desktop → MCP Protocol → Claude Squad Server → tmux Sessions → Ag
 ## Troubleshooting
 
 ### Server Not Connecting
+
 1. Check that the path in `claude_desktop_config.json` is correct and absolute
 2. Ensure the binary has execute permissions: `chmod +x claude-squad`
 3. Check Claude Desktop logs for error messages
 
 ### Agents Not Launching
+
 1. Ensure tmux is installed: `tmux -V`
 2. Check that the specified program (e.g., aider) is available in PATH
 3. Verify you're in a git repository (required by claude-squad)
 
 ### Testing the Server
+
 You can test the MCP server manually:
 
 ```bash
