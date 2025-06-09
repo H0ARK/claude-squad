@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"claude-squad/config"
 	"claude-squad/log"
 	"claude-squad/session"
 	"context"
@@ -27,19 +28,40 @@ type AgentInfo struct {
 type AgentManager struct {
 	agents   map[string]AgentInfo
 	instances map[string]*session.Instance
+	storage  *session.Storage
 	mu      sync.RWMutex
 }
 
 func NewAgentManager() *AgentManager {
-	return &AgentManager{
-		agents:   make(map[string]AgentInfo),
-		instances: make(map[string]*session.Instance),
+	// Initialize storage to share with main claude-squad UI
+	appState := config.LoadState()
+	storage, err := session.NewStorage(appState)
+	if err != nil {
+		log.ErrorLog.Printf("Failed to initialize MCP storage: %v", err)
+		return nil
 	}
+
+	am := &AgentManager{
+		agents:    make(map[string]AgentInfo),
+		instances: make(map[string]*session.Instance),
+		storage:   storage,
+	}
+
+	// Load existing instances from storage
+	if err := am.loadInstancesFromStorage(); err != nil {
+		log.ErrorLog.Printf("Failed to load existing instances: %v", err)
+	}
+
+	return am
 }
 
 // CreateMCPServer creates and configures the MCP server with agent management tools
 func CreateMCPServer() *server.MCPServer {
 	agentManager := NewAgentManager()
+	if agentManager == nil {
+		log.ErrorLog.Printf("Failed to create agent manager")
+		return nil
+	}
 
 	// Create the MCP server
 	s := server.NewMCPServer(
@@ -217,6 +239,11 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 	am.instances[agentID] = instance
 	am.mu.Unlock()
 
+	// Save instance to shared storage so it appears in main UI
+	if err := am.saveInstancesToStorage(); err != nil {
+		log.ErrorLog.Printf("Failed to save instances to storage: %v", err)
+	}
+
 	return fmt.Sprintf("Agent %s launched successfully as claude-squad instance '%s' with task: %s", agentID, title, task), nil
 }
 
@@ -333,6 +360,74 @@ func (am *AgentManager) sendOutputToMain(agentID string) error {
 	cmd2 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", "C-m")
 	if err := cmd2.Run(); err != nil {
 		return fmt.Errorf("failed to send enter to main: %w", err)
+	}
+
+	return nil
+}
+
+// saveInstancesToStorage saves all current instances to the shared storage
+func (am *AgentManager) saveInstancesToStorage() error {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	// Load existing instances to merge with MCP instances
+	existingInstances, err := am.storage.LoadInstances()
+	if err != nil {
+		return fmt.Errorf("failed to load existing instances: %w", err)
+	}
+
+	// Create a map of existing non-MCP instances
+	nonMCPInstances := make(map[string]*session.Instance)
+	for _, instance := range existingInstances {
+		if !strings.HasPrefix(instance.Title, "Agent-agent-") {
+			nonMCPInstances[instance.Title] = instance
+		}
+	}
+
+	// Combine non-MCP instances with current MCP instances
+	var allInstances []*session.Instance
+	
+	// Add non-MCP instances
+	for _, instance := range nonMCPInstances {
+		allInstances = append(allInstances, instance)
+	}
+	
+	// Add current MCP instances
+	for _, instance := range am.instances {
+		allInstances = append(allInstances, instance)
+	}
+
+	return am.storage.SaveInstances(allInstances)
+}
+
+// loadInstancesFromStorage loads existing instances from shared storage
+func (am *AgentManager) loadInstancesFromStorage() error {
+	instances, err := am.storage.LoadInstances()
+	if err != nil {
+		return fmt.Errorf("failed to load instances: %w", err)
+	}
+
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	// Only load instances that look like they were created by MCP (have Agent- prefix)
+	for _, instance := range instances {
+		if strings.HasPrefix(instance.Title, "Agent-agent-") {
+			// Extract agent ID from title (format: Agent-agent-1234567890)
+			parts := strings.Split(instance.Title, "-")
+			if len(parts) >= 3 {
+				agentID := strings.Join(parts[1:], "-") // agent-1234567890
+				am.instances[agentID] = instance
+				am.agents[agentID] = AgentInfo{
+					ID:         agentID,
+					SessionID:  instance.Title,
+					Task:       "", // Task info is lost on reload
+					Status:     "active",
+					CreatedAt:  instance.CreatedAt,
+					LastActive: instance.UpdatedAt,
+				}
+			}
+		}
 	}
 
 	return nil
