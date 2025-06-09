@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -279,89 +278,187 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 }
 
 func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
-	// If an overlay is active, it should be the only thing that can be updated.
-	if m.textInputOverlay != nil {
-		// Check if already submitted/canceled before processing
-		if m.textInputOverlay.IsSubmitted() {
-			return m.handleNewInstanceSubmit()
-		}
-		if m.textInputOverlay.IsCanceled() {
-			m.list.Kill()
-			m.textInputOverlay = nil
-			m.state = stateDefault
-			m.menu.SetState(ui.StateDefault)
-			return m, m.instanceChanged()
-		}
-		
-		// Handle special keys for session naming
-		switch msg.String() {
-		case "enter":
-			// For session naming, Enter should always submit
-			m.textInputOverlay.Submitted = true
-			return m.handleNewInstanceSubmit()
-		case "ctrl+c", "esc":
-			m.textInputOverlay.Canceled = true
-			m.list.Kill()
-			m.textInputOverlay = nil
-			m.state = stateDefault
-			m.menu.SetState(ui.StateDefault)
-			return m, m.instanceChanged()
-		default:
-			// Process other keys normally
-			shouldClose := m.textInputOverlay.HandleKeyPress(msg)
-			if shouldClose {
-				// Check state after processing
-				if m.textInputOverlay.IsCanceled() {
-					// Handle cancellation
-					m.list.Kill()
-					m.textInputOverlay = nil
-					m.state = stateDefault
-					m.menu.SetState(ui.StateDefault)
-					return m, m.instanceChanged()
-				} else if m.textInputOverlay.IsSubmitted() {
-					// Handle submission
-					return m.handleNewInstanceSubmit()
-				}
-			}
-		}
-		return m, nil
-	}
-	if m.textOverlay != nil && !m.textOverlay.Dismissed {
-		return m.handleHelpState(msg)
-	}
-
 	cmd, returnEarly := m.handleMenuHighlighting(msg)
 	if returnEarly {
 		return m, cmd
 	}
 
-	switch keypress := msg.String(); keypress {
-	case "ctrl+c":
-		return m.handleQuit()
-	case "q":
-		if m.state == stateDefault {
-			return m.handleQuit()
-		}
+	if m.state == stateHelp {
+		return m.handleHelpState(msg)
 	}
 
-	// Key presses handled by the list component
-	if m.list.GetSelectedInstance() != nil && m.list.GetSelectedInstance().Paused() {
-		// If paused, only allow a subset of keys
-		switch keys.GlobalKeyStringsMap[msg.String()] {
-		case keys.KeyResume, keys.KeyKill, keys.KeyUp, keys.KeyDown, keys.KeyHelp, keys.KeyQuit:
-			// Allow these keys
+	if m.state == stateNew {
+		// Handle quit commands first. Don't handle q because the user might want to type that.
+		if msg.String() == "ctrl+c" {
+			m.state = stateDefault
+			m.promptAfterName = false
+			m.list.Kill()
+			return m, tea.Sequence(
+				tea.WindowSize(),
+				func() tea.Msg {
+					m.menu.SetState(ui.StateDefault)
+					return nil
+				},
+			)
+		}
+
+		instance := m.list.GetInstances()[m.list.NumInstances()-1]
+		switch msg.Type {
+		// Start the instance (enable previews etc) and go back to the main menu state.
+		case tea.KeyEnter:
+			if len(instance.Title) == 0 {
+				return m, m.handleError(fmt.Errorf("title cannot be empty"))
+			}
+
+			if err := instance.Start(true); err != nil {
+				m.list.Kill()
+				m.state = stateDefault
+				return m, m.handleError(err)
+			}
+			// Save after adding new instance
+			if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+				return m, m.handleError(err)
+			}
+			// Instance added successfully, call the finalizer.
+			m.newInstanceFinalizer()
+			if m.autoYes {
+				instance.AutoYes = true
+			}
+
+			m.newInstanceFinalizer()
+			m.state = stateDefault
+			if m.promptAfterName {
+				m.state = statePrompt
+				m.menu.SetState(ui.StatePrompt)
+				// Initialize the text input overlay
+				m.textInputOverlay = overlay.NewTextInputOverlay("Enter prompt", "")
+				m.promptAfterName = false
+			} else {
+				m.menu.SetState(ui.StateDefault)
+				m.showHelpScreen(helpTypeInstanceStart, nil)
+			}
+
+			return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
+		case tea.KeyRunes:
+			if len(instance.Title) >= 32 {
+				return m, m.handleError(fmt.Errorf("title cannot be longer than 32 characters"))
+			}
+			if err := instance.SetTitle(instance.Title + string(msg.Runes)); err != nil {
+				return m, m.handleError(err)
+			}
+		case tea.KeyBackspace:
+			if len(instance.Title) == 0 {
+				return m, nil
+			}
+			if err := instance.SetTitle(instance.Title[:len(instance.Title)-1]); err != nil {
+				return m, m.handleError(err)
+			}
+		case tea.KeySpace:
+			if err := instance.SetTitle(instance.Title + " "); err != nil {
+				return m, m.handleError(err)
+			}
+		case tea.KeyEsc:
+			m.list.Kill()
+			m.state = stateDefault
+			m.instanceChanged()
+
+			return m, tea.Sequence(
+				tea.WindowSize(),
+				func() tea.Msg {
+					m.menu.SetState(ui.StateDefault)
+					return nil
+				},
+			)
 		default:
-			return m, nil
 		}
+		return m, nil
+	} else if m.state == statePrompt {
+		// Use the new TextInputOverlay component to handle all key events
+		shouldClose := m.textInputOverlay.HandleKeyPress(msg)
+
+		// Check if the form was submitted or canceled
+		if shouldClose {
+			if m.textInputOverlay.IsSubmitted() {
+				// Form was submitted, process the input
+				selected := m.list.GetSelectedInstance()
+				if selected == nil {
+					return m, nil
+				}
+				if err := selected.SendPrompt(m.textInputOverlay.GetValue()); err != nil {
+					return m, m.handleError(err)
+				}
+			}
+
+			// Close the overlay and reset state
+			m.textInputOverlay = nil
+			m.state = stateDefault
+			return m, tea.Sequence(
+				tea.WindowSize(),
+				func() tea.Msg {
+					m.menu.SetState(ui.StateDefault)
+					m.showHelpScreen(helpTypeInstanceStart, nil)
+					return nil
+				},
+			)
+		}
+
+		return m, nil
 	}
 
-	switch keys.GlobalKeyStringsMap[msg.String()] {
+	// Handle quit commands first
+	if msg.String() == "ctrl+c" || msg.String() == "q" {
+		return m.handleQuit()
+	}
+
+	name, ok := keys.GlobalKeyStringsMap[msg.String()]
+	if !ok {
+		return m, nil
+	}
+
+	switch name {
 	case keys.KeyHelp:
 		return m.showHelpScreen(helpTypeGeneral, nil)
 	case keys.KeyPrompt:
-		return m.handleNewInstance(true)
+		if m.list.NumInstances() >= GlobalInstanceLimit {
+			return m, m.handleError(
+				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+		}
+		instance, err := session.NewInstance(session.InstanceOptions{
+			Title:   "",
+			Path:    ".",
+			Program: m.program,
+		})
+		if err != nil {
+			return m, m.handleError(err)
+		}
+
+		m.newInstanceFinalizer = m.list.AddInstance(instance)
+		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+		m.state = stateNew
+		m.menu.SetState(ui.StateNewInstance)
+		m.promptAfterName = true
+
+		return m, nil
 	case keys.KeyNew:
-		return m.handleNewInstance(false)
+		if m.list.NumInstances() >= GlobalInstanceLimit {
+			return m, m.handleError(
+				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
+		}
+		instance, err := session.NewInstance(session.InstanceOptions{
+			Title:   "",
+			Path:    ".",
+			Program: m.program,
+		})
+		if err != nil {
+			return m, m.handleError(err)
+		}
+
+		m.newInstanceFinalizer = m.list.AddInstance(instance)
+		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+		m.state = stateNew
+		m.menu.SetState(ui.StateNewInstance)
+
+		return m, nil
 	case keys.KeyUp:
 		m.list.Up()
 		return m, m.instanceChanged()
@@ -381,7 +478,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	case keys.KeyTab:
 		m.tabbedWindow.Toggle()
 		m.menu.SetInDiffTab(m.tabbedWindow.IsInDiffTab())
-		return m, nil
+		return m, m.instanceChanged()
 	case keys.KeyKill:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil {
@@ -434,12 +531,13 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 
 		// Show help screen before pausing
-		return m.showHelpScreen(helpTypeInstanceCheckout, func() {
+		m.showHelpScreen(helpTypeInstanceCheckout, func() {
 			if err := selected.Pause(); err != nil {
 				m.handleError(err)
 			}
 			m.instanceChanged()
 		})
+		return m, nil
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil {
@@ -458,7 +556,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		// Show help screen before attaching
-		return m.showHelpScreen(helpTypeInstanceAttach, func() {
+		m.showHelpScreen(helpTypeInstanceAttach, func() {
 			ch, err := m.list.Attach()
 			if err != nil {
 				m.handleError(err)
@@ -467,78 +565,10 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			<-ch
 			m.state = stateDefault
 		})
+		return m, nil
 	default:
 		return m, nil
 	}
-}
-
-func (m *home) handleNewInstanceSubmit() (tea.Model, tea.Cmd) {
-	if m.textInputOverlay == nil {
-		return m, nil
-	}
-
-	// Set title of instance from text input
-	selected := m.list.GetSelectedInstance()
-	if selected == nil {
-		return m, nil
-	}
-
-	inputValue := m.textInputOverlay.GetValue()
-	parts := strings.SplitN(inputValue, "--", 2)
-	title := strings.TrimSpace(parts[0])
-	var flags []string
-	if len(parts) > 1 {
-		flagStr := strings.TrimSpace(parts[1])
-		if flagStr != "" {
-			flags = strings.Fields(flagStr)
-		}
-	}
-
-	if err := selected.SetTitle(title); err != nil {
-		return m, m.handleError(err)
-	}
-	selected.Flags = flags
-	m.textInputOverlay = nil // remove overlay
-
-	m.newInstanceFinalizer()
-
-	// After naming, optionally go to prompt state
-	if m.promptAfterName {
-		m.state = statePrompt
-		m.menu.SetState(ui.StatePrompt)
-		m.promptAfterName = false
-		m.textInputOverlay = overlay.NewTextInputOverlay("Enter prompt...", "")
-	} else {
-		m.state = stateDefault
-		m.menu.SetState(ui.StateDefault)
-	}
-
-	return m, m.instanceChanged()
-}
-
-func (m *home) handleNewInstance(prompt bool) (tea.Model, tea.Cmd) {
-	if m.list.NumInstances() >= GlobalInstanceLimit {
-		return m, m.handleError(
-			fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
-	}
-	instance, err := session.NewInstance(session.InstanceOptions{
-		Title:   "",
-		Path:    ".",
-		Program: m.program,
-	})
-	if err != nil {
-		return m, m.handleError(err)
-	}
-
-	m.newInstanceFinalizer = m.list.AddInstance(instance)
-	m.list.SetSelectedInstance(m.list.NumInstances() - 1)
-	m.state = stateNew
-	m.menu.SetState(ui.StateNewInstance)
-	m.promptAfterName = prompt
-
-	m.textInputOverlay = overlay.NewTextInputOverlay("Enter name for new session...", "")
-
-	return m, nil
 }
 
 // instanceChanged updates the preview pane, menu, and diff pane based on the selected instance. It returns an error

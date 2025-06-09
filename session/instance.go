@@ -51,8 +51,6 @@ type Instance struct {
 	AutoYes bool
 	// Prompt is the initial prompt to pass to the instance on startup
 	Prompt string
-	// Flags are extra flags to pass to the program
-	Flags []string
 
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
@@ -79,7 +77,6 @@ func (i *Instance) ToInstanceData() InstanceData {
 		UpdatedAt: time.Now(),
 		Program:   i.Program,
 		AutoYes:   i.AutoYes,
-		Flags:     i.Flags,
 	}
 
 	// Only include worktree data if gitWorktree is initialized
@@ -117,8 +114,6 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		CreatedAt: data.CreatedAt,
 		UpdatedAt: data.UpdatedAt,
 		Program:   data.Program,
-		AutoYes:   data.AutoYes,
-		Flags:     data.Flags,
 		gitWorktree: git.NewGitWorktreeFromStorage(
 			data.Worktree.RepoPath,
 			data.Worktree.WorktreePath,
@@ -155,8 +150,6 @@ type InstanceOptions struct {
 	Program string
 	// If AutoYes is true, then
 	AutoYes bool
-	// Flags are extra flags to pass to the program
-	Flags []string
 }
 
 func NewInstance(opts InstanceOptions) (*Instance, error) {
@@ -178,7 +171,6 @@ func NewInstance(opts InstanceOptions) (*Instance, error) {
 		CreatedAt: t,
 		UpdatedAt: t,
 		AutoYes:   false,
-		Flags:     opts.Flags,
 	}, nil
 }
 
@@ -237,11 +229,7 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 		}
 
 		// Create new session
-		programWithFlags := i.Program
-		if len(i.Flags) > 0 {
-			programWithFlags = fmt.Sprintf("%s %s", i.Program, strings.Join(i.Flags, " "))
-		}
-		if err := i.tmuxSession.Start(programWithFlags, i.gitWorktree.GetWorktreePath()); err != nil {
+		if err := i.tmuxSession.Start(i.Program, i.gitWorktree.GetWorktreePath()); err != nil {
 			// Cleanup git worktree if tmux session creation fails
 			if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
 				err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
@@ -308,14 +296,14 @@ func (i *Instance) Close() error {
 }
 
 func (i *Instance) Preview() (string, error) {
-	if !i.started || i.Status == Paused || i.tmuxSession == nil {
+	if !i.started || i.Status == Paused {
 		return "", nil
 	}
 	return i.tmuxSession.CapturePaneContent()
 }
 
 func (i *Instance) HasUpdated() (updated bool, hasPrompt bool) {
-	if !i.started || i.tmuxSession == nil {
+	if !i.started {
 		return false, false
 	}
 	return i.tmuxSession.HasUpdated()
@@ -323,7 +311,7 @@ func (i *Instance) HasUpdated() (updated bool, hasPrompt bool) {
 
 // TapEnter sends an enter key press to the tmux session if AutoYes is enabled.
 func (i *Instance) TapEnter() {
-	if !i.started || !i.AutoYes || i.tmuxSession == nil {
+	if !i.started || !i.AutoYes {
 		return
 	}
 	if err := i.tmuxSession.TapEnter(); err != nil {
@@ -335,9 +323,6 @@ func (i *Instance) Attach() (chan struct{}, error) {
 	if !i.started {
 		return nil, fmt.Errorf("cannot attach instance that has not been started")
 	}
-	if i.tmuxSession == nil {
-		return nil, fmt.Errorf("tmux session not initialized")
-	}
 	return i.tmuxSession.Attach()
 }
 
@@ -345,9 +330,6 @@ func (i *Instance) SetPreviewSize(width, height int) error {
 	if !i.started || i.Status == Paused {
 		return fmt.Errorf("cannot set preview size for instance that has not been started or " +
 			"is paused")
-	}
-	if i.tmuxSession == nil {
-		return fmt.Errorf("tmux session not initialized")
 	}
 	return i.tmuxSession.SetDetachedSize(width, height)
 }
@@ -380,9 +362,6 @@ func (i *Instance) Paused() bool {
 
 // TmuxAlive returns true if the tmux session is alive. This is a sanity check before attaching.
 func (i *Instance) TmuxAlive() bool {
-	if i.tmuxSession == nil {
-		return false
-	}
 	return i.tmuxSession.DoesSessionExist()
 }
 
