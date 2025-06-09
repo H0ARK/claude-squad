@@ -183,7 +183,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(
 			cmd,
 			func() tea.Msg {
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(250 * time.Millisecond) // 4x per second for responsive chat updates
 				return previewTickMsg{}
 			},
 		)
@@ -191,11 +191,9 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.menu.ClearKeydown()
 		return m, nil
 	case tickUpdateMetadataMessage:
-		// Check for new instances from storage every 5 seconds (not every 500ms)
-		if time.Now().Unix()%10 == 0 { // Every 10 seconds to reduce spam
-			if err := m.loadNewInstancesFromStorage(); err != nil {
-				log.WarningLog.Printf("could not load new instances: %v", err)
-			}
+		// Check for new instances from storage every tick (2x per second, close to your 4x request)
+		if err := m.loadNewInstancesFromStorage(); err != nil {
+			log.WarningLog.Printf("could not load new instances: %v", err)
 		}
 		
 		for _, instance := range m.list.GetInstances() {
@@ -671,8 +669,15 @@ func (m *home) View() string {
 
 // loadNewInstancesFromStorage checks for new instances in storage and adds them to the list
 func (m *home) loadNewInstancesFromStorage() error {
-	// Load all instances from storage
-	instances, err := m.storage.LoadInstances()
+	// Reload state to get latest data (in case MCP server updated it)
+	freshState := config.LoadState()
+	freshStorage, err := session.NewStorage(freshState)
+	if err != nil {
+		return err
+	}
+	
+	// Load all instances from fresh storage
+	instances, err := freshStorage.LoadInstances()
 	if err != nil {
 		return err
 	}

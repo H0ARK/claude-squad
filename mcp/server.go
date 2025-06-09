@@ -423,11 +423,17 @@ func (am *AgentManager) saveInstancesToStorage() error {
 	// Add current MCP instances
 	for _, instance := range am.instances {
 		allInstances = append(allInstances, instance)
-		log.InfoLog.Printf("Adding MCP instance to storage: %s", instance.Title)
+		log.InfoLog.Printf("Adding MCP instance to storage: %s (started: %v)", instance.Title, instance.Started())
 	}
 
 	log.InfoLog.Printf("Saving total of %d instances to storage", len(allInstances))
-	return am.storage.SaveInstances(allInstances)
+	err = am.storage.SaveInstances(allInstances)
+	if err != nil {
+		log.ErrorLog.Printf("Failed to save instances to storage: %v", err)
+		return err
+	}
+	log.InfoLog.Printf("Successfully saved all instances to storage")
+	return nil
 }
 
 // loadInstancesFromStorage loads existing instances from shared storage

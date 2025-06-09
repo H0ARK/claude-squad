@@ -4,6 +4,7 @@ import (
 	"claude-squad/config"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -57,7 +58,8 @@ func (s *Storage) SaveInstances(instances []*Instance) error {
 	// Convert instances to InstanceData
 	data := make([]InstanceData, 0)
 	for _, instance := range instances {
-		if instance.Started() {
+		// Save started instances, or MCP agent instances (which may have timing issues)
+		if instance.Started() || strings.HasPrefix(instance.Title, "Agent-agent-") {
 			data = append(data, instance.ToInstanceData())
 		}
 	}
