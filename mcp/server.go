@@ -224,6 +224,20 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 		return "", fmt.Errorf("failed to start instance: %w", err)
 	}
 
+	// Wait a moment for Claude Code to start up and show trust prompt
+	time.Sleep(2 * time.Second)
+	
+	// Auto-accept trust prompt by sending "1"
+	if err := instance.SendPrompt("1"); err != nil {
+		log.ErrorLog.Printf("Failed to send trust response to agent %s: %v", agentID, err)
+		// Don't kill on trust failure, continue
+	} else {
+		log.InfoLog.Printf("Sent trust response to agent %s", agentID)
+	}
+	
+	// Wait for trust to be processed
+	time.Sleep(1 * time.Second)
+	
 	// Send the initial task as a prompt to the agent
 	if task != "" {
 		if err := instance.SendPrompt(task); err != nil {
@@ -250,6 +264,8 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 	// Save instance to shared storage so it appears in main UI
 	if err := am.saveInstancesToStorage(); err != nil {
 		log.ErrorLog.Printf("Failed to save instances to storage: %v", err)
+	} else {
+		log.InfoLog.Printf("Successfully saved agent %s to storage for UI sync", agentID)
 	}
 
 	return fmt.Sprintf("Agent %s created as new session '%s' with task: %s", agentID, title, task), nil
@@ -378,11 +394,14 @@ func (am *AgentManager) saveInstancesToStorage() error {
 	am.mu.RLock()
 	defer am.mu.RUnlock()
 
+	log.InfoLog.Printf("Saving %d MCP instances to storage", len(am.instances))
+
 	// Load existing instances to merge with MCP instances
 	existingInstances, err := am.storage.LoadInstances()
 	if err != nil {
 		return fmt.Errorf("failed to load existing instances: %w", err)
 	}
+	log.InfoLog.Printf("Loaded %d existing instances from storage", len(existingInstances))
 
 	// Create a map of existing non-MCP instances
 	nonMCPInstances := make(map[string]*session.Instance)
@@ -391,6 +410,7 @@ func (am *AgentManager) saveInstancesToStorage() error {
 			nonMCPInstances[instance.Title] = instance
 		}
 	}
+	log.InfoLog.Printf("Found %d non-MCP instances to preserve", len(nonMCPInstances))
 
 	// Combine non-MCP instances with current MCP instances
 	var allInstances []*session.Instance
@@ -403,8 +423,10 @@ func (am *AgentManager) saveInstancesToStorage() error {
 	// Add current MCP instances
 	for _, instance := range am.instances {
 		allInstances = append(allInstances, instance)
+		log.InfoLog.Printf("Adding MCP instance to storage: %s", instance.Title)
 	}
 
+	log.InfoLog.Printf("Saving total of %d instances to storage", len(allInstances))
 	return am.storage.SaveInstances(allInstances)
 }
 

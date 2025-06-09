@@ -191,6 +191,13 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.menu.ClearKeydown()
 		return m, nil
 	case tickUpdateMetadataMessage:
+		// Check for new instances from storage every 5 seconds (not every 500ms)
+		if time.Now().Unix()%10 == 0 { // Every 10 seconds to reduce spam
+			if err := m.loadNewInstancesFromStorage(); err != nil {
+				log.WarningLog.Printf("could not load new instances: %v", err)
+			}
+		}
+		
 		for _, instance := range m.list.GetInstances() {
 			if !instance.Started() || instance.Paused() {
 				continue
@@ -660,4 +667,43 @@ func (m *home) View() string {
 	}
 
 	return mainView
+}
+
+// loadNewInstancesFromStorage checks for new instances in storage and adds them to the list
+func (m *home) loadNewInstancesFromStorage() error {
+	// Load all instances from storage
+	instances, err := m.storage.LoadInstances()
+	if err != nil {
+		return err
+	}
+	
+	log.InfoLog.Printf("UI: Loaded %d instances from storage", len(instances))
+	
+	// Get current instance titles
+	currentInstances := make(map[string]bool)
+	for _, instance := range m.list.GetInstances() {
+		currentInstances[instance.Title] = true
+	}
+	
+	log.InfoLog.Printf("UI: Currently have %d instances in list", len(currentInstances))
+	
+	// Add any new instances that aren't already in the list
+	newCount := 0
+	for _, instance := range instances {
+		if !currentInstances[instance.Title] {
+			// New instance found, add it to the list
+			m.list.AddInstance(instance)()
+			if m.autoYes {
+				instance.AutoYes = true
+			}
+			log.InfoLog.Printf("UI: Added new instance from storage: %s", instance.Title)
+			newCount++
+		}
+	}
+	
+	if newCount > 0 {
+		log.InfoLog.Printf("UI: Added %d new instances", newCount)
+	}
+	
+	return nil
 }
