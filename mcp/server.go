@@ -232,18 +232,24 @@ func (am *AgentManager) listAgents() string {
 	result.WriteString("Active agents:\n")
 
 	for _, agent := range am.agents {
-		// Check if tmux session still exists
-		cmd := exec.Command("tmux", "has-session", "-t", agent.SessionID)
+		// Check if tmux session still exists using formatted session name
+		sessionName := formatSessionName(agent.SessionID)
+		cmd := exec.Command("tmux", "has-session", "-t", sessionName)
 		status := "active"
 		if err := cmd.Run(); err != nil {
 			status = "inactive"
 		}
 
 		result.WriteString(fmt.Sprintf("- %s (Session: %s, Status: %s, Task: %s, Created: %s)\n",
-			agent.ID, agent.SessionID, status, agent.Task, agent.CreatedAt.Format("15:04:05")))
+			agent.ID, sessionName, status, agent.Task, agent.CreatedAt.Format("15:04:05")))
 	}
 
 	return result.String()
+}
+
+// formatSessionName converts a title to the tmux session name used by claude-squad
+func formatSessionName(title string) string {
+	return fmt.Sprintf("claudesquad_%s", strings.ReplaceAll(title, " ", ""))
 }
 
 func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
@@ -266,8 +272,8 @@ func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
 		return "", fmt.Errorf("agent %s instance not started", agentID)
 	}
 
-	// Use the instance title as the session name (claude-squad uses title for tmux session names)
-	sessionName := fmt.Sprintf("claudesquad_%s", strings.ReplaceAll(instance.Title, " ", ""))
+	// Use the formatted session name
+	sessionName := formatSessionName(instance.Title)
 
 	cmd1 := exec.Command("tmux", "send-keys", "-t", sessionName, message)
 	if err := cmd1.Run(); err != nil {
@@ -297,8 +303,11 @@ func (am *AgentManager) getAgentOutput(agentID string, lines int) (string, error
 		return "", fmt.Errorf("agent %s not found", agentID)
 	}
 
+	// Use the formatted session name (same as sendMessage)
+	sessionName := formatSessionName(agent.SessionID)
+
 	// Capture tmux pane output
-	cmd := exec.Command("tmux", "capture-pane", "-t", agent.SessionID, "-p", "-S", fmt.Sprintf("-%d", lines))
+	cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", fmt.Sprintf("-%d", lines))
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to capture output from agent %s: %w", agentID, err)
