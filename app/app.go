@@ -4,20 +4,17 @@ import (
 	"claude-squad/config"
 	"claude-squad/keys"
 	"claude-squad/log"
-	"claude-squad/mcp"
 	"claude-squad/session"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 const GlobalInstanceLimit = 10
@@ -33,47 +30,6 @@ func Run(ctx context.Context, program string, autoYes bool) error {
 	return err
 }
 
-// RunWithMCP runs the application with both UI and MCP server over SSE
-func RunWithMCP(ctx context.Context, program string, autoYes bool) error {
-	mcpServer := mcp.CreateMCPServer()
-	if mcpServer == nil {
-		return fmt.Errorf("failed to create MCP server")
-	}
-	
-	// Create SSE server
-	sseServer := server.NewSSEServer(mcpServer)
-	
-	// Set up HTTP server for SSE transport
-	mux := http.NewServeMux()
-	mux.Handle("/sse", sseServer.SSEHandler())
-	mux.Handle("/message", sseServer.MessageHandler())
-	
-	// Add a health check endpoint
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("MCP Server OK"))
-	})
-	
-	fmt.Printf("🚀 Claude Squad MCP Mode\n")
-	fmt.Printf("   UI available with session management\n")
-	fmt.Printf("   MCP Server: http://localhost:8080\n")
-	fmt.Printf("   SSE endpoint: http://localhost:8080/sse\n")
-	fmt.Printf("   Message endpoint: http://localhost:8080/message\n")
-	fmt.Printf("   Health check: http://localhost:8080/health\n\n")
-	
-	// Start HTTP server in a goroutine
-	go func() {
-		if err := http.ListenAndServe(":8080", mux); err != nil {
-			log.ErrorLog.Printf("MCP server error: %v", err)
-		}
-	}()
-	
-	// Give the HTTP server a moment to start
-	time.Sleep(200 * time.Millisecond)
-
-	// Run the UI in the main thread
-	return Run(ctx, program, autoYes)
-}
 
 
 type state int
