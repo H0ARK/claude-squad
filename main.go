@@ -5,12 +5,14 @@ import (
 	"claude-squad/config"
 	"claude-squad/daemon"
 	"claude-squad/log"
+	"claude-squad/mcp"
 	"claude-squad/session"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -159,6 +161,24 @@ func init() {
 }
 
 func main() {
+	// Check if we're being run as an MCP server (when called by Claude Desktop)
+	// This happens when the program is invoked without any command line arguments
+	// and stdin is connected to a pipe (from Claude Desktop)
+	if len(os.Args) == 1 {
+		// Check if stdin is connected to a pipe (indicating MCP mode)
+		stat, err := os.Stdin.Stat()
+		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+			// We're being run as an MCP server
+			server := mcp.NewMCPServer()
+			if err := server.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
+
+	// Normal CLI mode
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 	}
