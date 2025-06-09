@@ -2,6 +2,7 @@ package session
 
 import (
 	"claude-squad/config"
+	"claude-squad/log"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -82,41 +83,63 @@ func (s *Storage) LoadInstances() ([]*Instance, error) {
 		return nil, fmt.Errorf("failed to unmarshal instances: %w", err)
 	}
 
+	log.InfoLog.Printf("LoadInstances: Unmarshaled %d instances from JSON", len(instancesData))
+	for i, data := range instancesData {
+		log.InfoLog.Printf("LoadInstances: Instance %d: title='%s', path='%s'", i, data.Title, data.Path)
+	}
+
 	instances := make([]*Instance, len(instancesData))
 	for i, data := range instancesData {
+		log.InfoLog.Printf("LoadInstances: Creating instance from data: %s", data.Title)
 		instance, err := FromInstanceData(data)
 		if err != nil {
+			log.ErrorLog.Printf("LoadInstances: Failed to create instance %s: %v", data.Title, err)
 			return nil, fmt.Errorf("failed to create instance %s: %w", data.Title, err)
 		}
 		instances[i] = instance
+		log.InfoLog.Printf("LoadInstances: Successfully created instance: %s", data.Title)
 	}
 
+	log.InfoLog.Printf("LoadInstances: Returning %d instances", len(instances))
 	return instances, nil
 }
 
 // DeleteInstance removes an instance from storage
 func (s *Storage) DeleteInstance(title string) error {
-	instances, err := s.LoadInstances()
+	// Always get fresh state to ensure we see latest changes from MCP
+	freshState := config.LoadState()
+	freshStorage, err := NewStorage(freshState)
+	if err != nil {
+		return fmt.Errorf("failed to create fresh storage: %w", err)
+	}
+	
+	instances, err := freshStorage.LoadInstances()
 	if err != nil {
 		return fmt.Errorf("failed to load instances: %w", err)
 	}
 
 	found := false
 	newInstances := make([]*Instance, 0)
+	log.InfoLog.Printf("DELETE: Looking for instance '%s' among %d loaded instances", title, len(instances))
+	
 	for _, instance := range instances {
 		data := instance.ToInstanceData()
+		log.InfoLog.Printf("DELETE: Checking instance '%s' against target '%s'", data.Title, title)
 		if data.Title != title {
 			newInstances = append(newInstances, instance)
 		} else {
 			found = true
+			log.InfoLog.Printf("DELETE: Found instance to delete: '%s'", title)
 		}
 	}
 
 	if !found {
+		log.ErrorLog.Printf("DELETE: Instance not found in storage: '%s'", title)
 		return fmt.Errorf("instance not found: %s", title)
 	}
 
-	return s.SaveInstances(newInstances)
+	log.InfoLog.Printf("DELETE: Saving %d remaining instances after deleting '%s'", len(newInstances), title)
+	return freshStorage.SaveInstances(newInstances)
 }
 
 // UpdateInstance updates an existing instance in storage

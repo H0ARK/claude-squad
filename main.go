@@ -50,6 +50,9 @@ var (
 				return fmt.Errorf("error: claude-squad must be run from within a git repository")
 			}
 
+			// Store the root directory globally for consistent use across UI and MCP
+			config.SetRootDirectory(currentDir)
+
 			cfg := config.LoadConfig()
 
 			// Program flag overrides config

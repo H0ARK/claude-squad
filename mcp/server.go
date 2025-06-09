@@ -6,6 +6,7 @@ import (
 	"claude-squad/session"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -17,12 +18,23 @@ import (
 
 // Agent management types
 type AgentInfo struct {
-	ID         string    `json:"id"`
-	SessionID  string    `json:"session_id"`
-	Task       string    `json:"task,omitempty"`
-	Status     string    `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastActive time.Time `json:"last_active"`
+	ID           string    `json:"id"`
+	SessionID    string    `json:"session_id"`
+	Task         string    `json:"task,omitempty"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastActive   time.Time `json:"last_active"`
+	IsResponding bool      `json:"is_responding"` // Track if agent is currently responding
+	AutoResponse bool      `json:"auto_response"` // Enable auto-response monitoring
+	AgentType    string    `json:"agent_type"`    // Type of agent (claude, research-agent, etc.)
+	NonInteractive bool    `json:"non_interactive"` // Whether agent is running in --print mode
+}
+
+// Pre-configured agent types
+type AgentPreset struct {
+	Program     string
+	SystemPrompt string
+	Description string
 }
 
 type AgentManager struct {
@@ -30,6 +42,11 @@ type AgentManager struct {
 	instances map[string]*session.Instance
 	storage  *session.Storage
 	mu      sync.RWMutex
+	responseMonitors map[string]chan struct{} // For stopping monitoring goroutines
+	lastNotifications map[string]string // Track last notification sent per agent to prevent duplicates
+	lastNotificationTime map[string]time.Time // Track when last notification was sent
+	presets map[string]AgentPreset // Pre-configured agent types
+	finalOutputs map[string]string // Store final outputs for completed agents
 }
 
 func NewAgentManager() *AgentManager {
@@ -45,6 +62,11 @@ func NewAgentManager() *AgentManager {
 		agents:    make(map[string]AgentInfo),
 		instances: make(map[string]*session.Instance),
 		storage:   storage,
+		responseMonitors: make(map[string]chan struct{}),
+		lastNotifications: make(map[string]string),
+		lastNotificationTime: make(map[string]time.Time),
+		presets: initializeAgentPresets(),
+		finalOutputs: make(map[string]string),
 	}
 
 	// Load existing instances from storage
@@ -53,6 +75,32 @@ func NewAgentManager() *AgentManager {
 	}
 
 	return am
+}
+
+// initializeAgentPresets defines the pre-configured agent types
+func initializeAgentPresets() map[string]AgentPreset {
+	return map[string]AgentPreset{
+		"claude": {
+			Program:     "node /Users/conrad/Documents/github/claude-squad/claude-yolo-silent.mjs",
+			SystemPrompt: "",
+			Description: "Standard Claude agent for general tasks",
+		},
+		"research-agent": {
+			Program:     "node /Users/conrad/Documents/github/claude-squad/claude-yolo-silent.mjs",
+			SystemPrompt: "You are a specialized research agent. Your role is to:\n1. Thoroughly research topics using all available information\n2. Provide comprehensive, well-sourced findings\n3. Structure your research with clear sections: Overview, Key Findings, Sources, Recommendations\n4. Be methodical and analytical in your approach\n5. Always fact-check and provide multiple perspectives when relevant\n6. Format your final research report clearly with headers and bullet points",
+			Description: "Specialized agent for comprehensive research tasks",
+		},
+		"coding-agent": {
+			Program:     "node /Users/conrad/Documents/github/claude-squad/claude-yolo-silent.mjs",
+			SystemPrompt: "You are a specialized coding agent. Focus on:\n1. Writing clean, efficient, well-documented code\n2. Following best practices and industry standards\n3. Implementing proper error handling and testing\n4. Explaining your code decisions clearly\n5. Suggesting improvements and optimizations\n6. Being thorough in code reviews",
+			Description: "Specialized agent for coding tasks using Aider with Claude Sonnet",
+		},
+		"analysis-agent": {
+			Program:     "node /Users/conrad/Documents/github/claude-squad/claude-yolo-silent.mjs",
+			SystemPrompt: "You are a data analysis and insights agent. Your expertise includes:\n1. Breaking down complex problems into analyzable components\n2. Identifying patterns, trends, and anomalies in data\n3. Providing clear, actionable insights and recommendations\n4. Creating structured analysis reports with executive summaries\n5. Visualizing data relationships when relevant\n6. Ensuring conclusions are supported by evidence",
+			Description: "Specialized agent for data analysis and insights",
+		},
+	}
 }
 
 // CreateMCPServer creates and configures the MCP server with agent management tools
@@ -73,14 +121,25 @@ func CreateMCPServer() *server.MCPServer {
 
 	// Add launch_agent tool
 	launchAgentTool := mcp.NewTool("launch_agent",
-		mcp.WithDescription("Launch a new agent in a tmux session"),
+		mcp.WithDescription("Launch a new agent in a tmux session. The agent will automatically send responses back to the orchestrator when it completes tasks. Use 'agent_type' for pre-configured agents or 'program' for custom commands."),
 		mcp.WithString("task",
 			mcp.Required(),
 			mcp.Description("Description of the task for the new agent"),
 		),
-		mcp.WithString("program",
-			mcp.Description("Program to run (default: 'claude -p')"),
+		mcp.WithString("agent_type",
+			mcp.Description("Pre-configured agent type: claude, claude-yolo, research-agent, coding-agent, analysis-agent"),
 		),
+		mcp.WithString("program",
+			mcp.Description("Custom program to run (overrides agent_type if both provided)"),
+		),
+		mcp.WithString("interactive",
+			mcp.Description("Set to 'true' to use interactive mode instead of default --print mode (preserves current auto-response tracking)"),
+		),
+	)
+
+	// Add list_agent_types tool
+	listAgentTypesTool := mcp.NewTool("list_agent_types",
+		mcp.WithDescription("List all available pre-configured agent types with their descriptions"),
 	)
 
 	s.AddTool(launchAgentTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -89,13 +148,20 @@ func CreateMCPServer() *server.MCPServer {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		program := request.GetString("program", "claude")
+		agentType := request.GetString("agent_type", "")
+		program := request.GetString("program", "")
+		interactive := request.GetString("interactive", "false") == "true"
 
-		result, err := agentManager.launchAgent(task, program)
+		result, err := agentManager.launchAgent(task, agentType, program, interactive)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
+		return mcp.NewToolResultText(result), nil
+	})
+
+	s.AddTool(listAgentTypesTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		result := agentManager.listAgentTypes()
 		return mcp.NewToolResultText(result), nil
 	})
 
@@ -221,6 +287,20 @@ func CreateMCPServer() *server.MCPServer {
 		return mcp.NewToolResultText(result), nil
 	})
 
+	// Add force_clean_agents tool to remove persistent agents
+	cleanAgentsTool := mcp.NewTool("force_clean_agents",
+		mcp.WithDescription("Force remove all MCP agents from storage and tracking to fix persistence issues"),
+	)
+
+	s.AddTool(cleanAgentsTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		result, err := agentManager.forceCleanAgents()
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(result), nil
+	})
+
+
 	// Add delete_agent tool
 	deleteAgentTool := mcp.NewTool("delete_agent",
 		mcp.WithDescription("Delete an agent and clean up its tmux session and worktree"),
@@ -248,30 +328,59 @@ func CreateMCPServer() *server.MCPServer {
 }
 
 // Agent management methods
-func (am *AgentManager) launchAgent(task, program string) (string, error) {
+func (am *AgentManager) launchAgent(task, agentType, program string, interactive bool) (string, error) {
 	// Generate unique agent ID and title
 	agentID := fmt.Sprintf("agent-%d", time.Now().Unix())
 	title := fmt.Sprintf("Agent-%s", agentID)
 
-	// Bypass UI - create instance directly using claude-squad's session.NewInstance
-	actualProgram := "claude"
+	// Determine program and system prompt from agent type or custom program
+	var actualProgram string
+	var systemPrompt string
+	var finalAgentType string
+	
 	if program != "" && program != "claude-squad" && program != "./claude-squad" {
+		// Custom program provided - use it directly
 		actualProgram = program
+		systemPrompt = ""
+		finalAgentType = "custom"
+	} else if agentType != "" {
+		// Use pre-configured agent type
+		if preset, exists := am.presets[agentType]; exists {
+			baseProgram := preset.Program
+			systemPrompt = preset.SystemPrompt
+			finalAgentType = agentType
+			
+			// For now, always use interactive mode since --print mode is having issues
+			// We'll send the system prompt as part of the task instead
+			actualProgram = baseProgram
+		} else {
+			return "", fmt.Errorf("unknown agent type: %s", agentType)
+		}
+	} else {
+		// Default to standard claude
+		actualProgram = "node /Users/conrad/Documents/github/claude-squad/claude-yolo-silent.mjs"
+		systemPrompt = ""
+		finalAgentType = "claude-yolo"
 	}
 	
-	log.InfoLog.Printf("Creating agent %s directly (bypassing UI) with program '%s'", agentID, actualProgram)
+	log.InfoLog.Printf("Creating agent %s (type: %s) with program '%s'", agentID, finalAgentType, actualProgram)
 	
-	// Create instance using claude-squad's proper instance creation
+	// Create instance exactly like the UI does - path is automatically handled
+	// This ensures compatibility with the UI's instance management
 	instance, err := session.NewInstance(session.InstanceOptions{
-		Title:   title,
-		Path:    ".",
+		Title:   "",  // Start with empty title like UI
 		Program: actualProgram,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create agent instance: %w", err)
 	}
 
-	// Start the instance - this will create the tmux session and git worktree properly
+	// Set the title (like the UI does after user input)
+	if err := instance.SetTitle(title); err != nil {
+		return "", fmt.Errorf("failed to set agent title: %w", err)
+	}
+
+	// Start the instance with git worktree creation
 	if err := instance.Start(true); err != nil {
 		return "", fmt.Errorf("failed to start agent instance: %w", err)
 	}
@@ -285,40 +394,80 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 		Status:     "active",
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
+		IsResponding: false,
+		AutoResponse: true, // Always enable auto-response
+		AgentType:  finalAgentType,
+		NonInteractive: false, // Always use interactive mode for now
 	}
 	am.instances[agentID] = instance
+	
+	// Create monitor channel and start monitoring automatically
+	stopCh := make(chan struct{})
+	am.responseMonitors[agentID] = stopCh
 	am.mu.Unlock()
+	
+	// Start monitoring in background
+	go am.monitorAgentResponse(agentID, stopCh)
 
-	// Save to storage so it appears in UI immediately
-	if err := am.saveInstancesToStorage(); err != nil {
+	// Save to storage using the same method as UI
+	allInstances := []*session.Instance{instance}
+	// Add existing instances
+	existingInstances, err := am.storage.LoadInstances()
+	if err == nil {
+		allInstances = append(allInstances, existingInstances...)
+	}
+	
+	if err := am.storage.SaveInstances(allInstances); err != nil {
 		log.ErrorLog.Printf("Failed to save agent to storage: %v", err)
 	} else {
-		log.InfoLog.Printf("Saved agent %s to storage for UI sync", agentID)
+		log.InfoLog.Printf("Saved agent %s to storage using UI-compatible method", agentID)
 	}
 
-	// Wait for Claude Code to start and show trust prompt
-	time.Sleep(3 * time.Second)
+	// Wait longer for the claude-yolo wrapper to fully initialize 
+	// The wrapper needs time to modify the CLI and start properly
+	time.Sleep(8 * time.Second)
 	
-	// Auto-accept trust prompt by sending "1"
-	if err := instance.SendPrompt("1"); err != nil {
-		log.ErrorLog.Printf("Failed to send trust response to agent %s: %v", agentID, err)
-	} else {
-		log.InfoLog.Printf("Sent trust response to agent %s", agentID)
-	}
-	
-	// Wait for trust to be processed
-	time.Sleep(2 * time.Second)
-	
-	// Send the initial task as a prompt to the agent
+	// Send the task text first, then Enter separately (SendPrompt's Enter doesn't seem to work)
 	if task != "" {
-		if err := instance.SendPrompt(task); err != nil {
-			log.ErrorLog.Printf("Failed to send initial prompt to agent %s: %v", agentID, err)
+		var enhancedTask string
+		if systemPrompt != "" {
+			enhancedTask = fmt.Sprintf(`%s
+
+TASK: %s
+
+IMPORTANT: This agent is being monitored automatically. When you complete your task, your response will be automatically sent back to the orchestrator. No additional action is needed from you - just complete the task normally.`, systemPrompt, task)
 		} else {
-			log.InfoLog.Printf("Sent initial prompt to agent %s: %s", agentID, task)
+			enhancedTask = fmt.Sprintf(`%s
+
+IMPORTANT: This agent is being monitored automatically. When you complete your task, your response will be automatically sent back to the orchestrator. No additional action is needed from you - just complete the task normally.`, task)
 		}
+		
+		log.InfoLog.Printf("Sending text to agent %s", agentID)
+		// Send just the text without Enter using SendKeys directly
+		sessionName := formatSessionName(title)
+		cmd1 := exec.Command("tmux", "send-keys", "-t", sessionName, enhancedTask)
+		if err := cmd1.Run(); err != nil {
+			log.ErrorLog.Printf("Failed to send text to agent %s: %v", agentID, err)
+		} else {
+			log.InfoLog.Printf("Successfully sent text to agent %s", agentID)
+		}
+		
+		time.Sleep(1 * time.Second)
+		
+		log.InfoLog.Printf("Sending Enter to agent %s", agentID)
+		// Now send Enter separately  
+		cmd2 := exec.Command("tmux", "send-keys", "-t", sessionName, "C-m")
+		if err := cmd2.Run(); err != nil {
+			log.ErrorLog.Printf("Failed to send Enter to agent %s: %v", agentID, err)
+		} else {
+			log.InfoLog.Printf("Successfully sent Enter to agent %s", agentID)
+		}
+		
+		time.Sleep(2 * time.Second)
+		log.InfoLog.Printf("Agent %s should now be processing the task", agentID)
 	}
 
-	return fmt.Sprintf("Agent %s created directly (bypassing UI) with task: %s", agentID, task), nil
+	return fmt.Sprintf("Agent %s created with auto-response monitoring enabled. Task: %s\n\nThe agent will automatically send responses back to the orchestrator when it completes tasks.", agentID, task), nil
 }
 
 func (am *AgentManager) listAgents() string {
@@ -341,10 +490,35 @@ func (am *AgentManager) listAgents() string {
 			status = "inactive"
 		}
 
-		result.WriteString(fmt.Sprintf("- %s (Session: %s, Status: %s, Task: %s, Created: %s)\n",
-			agent.ID, sessionName, status, agent.Task, agent.CreatedAt.Format("15:04:05")))
+		mode := "non-interactive"
+		if !agent.NonInteractive {
+			mode = "interactive"
+		}
+		result.WriteString(fmt.Sprintf("- %s (Type: %s, Mode: %s, Session: %s, Status: %s, Task: %s, Created: %s)\n",
+			agent.ID, agent.AgentType, mode, sessionName, status, agent.Task, agent.CreatedAt.Format("15:04:05")))
 	}
 
+	return result.String()
+}
+
+func (am *AgentManager) listAgentTypes() string {
+	var result strings.Builder
+	result.WriteString("Available pre-configured agent types:\n\n")
+	
+	for typeName, preset := range am.presets {
+		result.WriteString(fmt.Sprintf("• %s: %s\n", typeName, preset.Description))
+		result.WriteString(fmt.Sprintf("  Program: %s\n", preset.Program))
+		if preset.SystemPrompt != "" {
+			// Show first line of system prompt
+			lines := strings.Split(preset.SystemPrompt, "\n")
+			result.WriteString(fmt.Sprintf("  System Prompt: %s...\n", lines[0]))
+		}
+		result.WriteString("\n")
+	}
+	
+	result.WriteString("Usage: Use 'agent_type' parameter in launch_agent with one of the types above.\n")
+	result.WriteString("Example: {\"agent_type\": \"research-agent\", \"task\": \"Research AI safety\"}")
+	
 	return result.String()
 }
 
@@ -404,10 +578,23 @@ func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
 func (am *AgentManager) getAgentOutput(agentID string, mode string, count int) (string, error) {
 	am.mu.RLock()
 	agent, exists := am.agents[agentID]
+	finalOutput, hasFinalOutput := am.finalOutputs[agentID]
 	am.mu.RUnlock()
 
 	if !exists {
 		return "", fmt.Errorf("agent %s not found", agentID)
+	}
+
+	// If agent is non-interactive and we have final output stored, use that instead of tmux
+	if agent.NonInteractive && hasFinalOutput {
+		switch mode {
+		case "last_message":
+			return am.parseLastMessageFromOutput(finalOutput, agentID)
+		case "last_x_messages":
+			return am.parseLastXMessagesFromOutput(finalOutput, agentID, count)
+		default:
+			return fmt.Sprintf("Final output from agent %s:\\n%s", agentID, finalOutput), nil
+		}
 	}
 
 	// Use the formatted session name (same as sendMessage)
@@ -729,10 +916,27 @@ func (am *AgentManager) saveInstancesToStorage() error {
 	log.InfoLog.Printf("Loaded %d existing instances from storage", len(existingInstances))
 
 	// Create a map of existing non-MCP instances
+	// Also preserve MCP instances that are in storage but NOT currently tracked
+	// (This means they were deleted and shouldn't be re-added)
 	nonMCPInstances := make(map[string]*session.Instance)
 	for _, instance := range existingInstances {
 		if !strings.HasPrefix(instance.Title, "Agent-agent-") {
+			// Regular non-MCP instance - always preserve
 			nonMCPInstances[instance.Title] = instance
+		} else {
+			// MCP instance - only preserve if we're NOT currently tracking it
+			// (If we're not tracking it, it was probably deleted)
+			found := false
+			for _, trackedInstance := range am.instances {
+				if trackedInstance.Title == instance.Title {
+					found = true
+					break
+				}
+			}
+			if !found {
+				// This MCP instance is not being tracked, so it was deleted - don't preserve it
+				log.InfoLog.Printf("Not preserving deleted MCP instance: %s", instance.Title)
+			}
 		}
 	}
 	log.InfoLog.Printf("Found %d non-MCP instances to preserve", len(nonMCPInstances))
@@ -772,20 +976,39 @@ func (am *AgentManager) loadInstancesFromStorage() error {
 	defer am.mu.Unlock()
 
 	// Only load instances that look like they were created by MCP (have Agent- prefix)
+	// BUT don't reload agents that were already being tracked (they might have been deleted)
 	for _, instance := range instances {
 		if strings.HasPrefix(instance.Title, "Agent-agent-") {
 			// Extract agent ID from title (format: Agent-agent-1234567890)
 			parts := strings.Split(instance.Title, "-")
 			if len(parts) >= 3 {
 				agentID := strings.Join(parts[1:], "-") // agent-1234567890
-				am.instances[agentID] = instance
-				am.agents[agentID] = AgentInfo{
-					ID:         agentID,
-					SessionID:  instance.Title,
-					Task:       "", // Task info is lost on reload
-					Status:     "active",
-					CreatedAt:  instance.CreatedAt,
-					LastActive: instance.UpdatedAt,
+				
+				// Only load if we're not already tracking this agent
+				// This prevents deleted agents from being automatically reloaded
+				if _, exists := am.agents[agentID]; !exists {
+					am.instances[agentID] = instance
+					am.agents[agentID] = AgentInfo{
+						ID:         agentID,
+						SessionID:  instance.Title,
+						Task:       "", // Task info is lost on reload
+						Status:     "active",
+						CreatedAt:  instance.CreatedAt,
+						LastActive: instance.UpdatedAt,
+						IsResponding: false,
+						AutoResponse: true, // Always enable auto-response
+						AgentType:  "unknown", // Type info is lost on reload
+						NonInteractive: true, // Default to non-interactive mode for reloaded agents
+					}
+					
+					// Start monitoring for existing agents too
+					stopCh := make(chan struct{})
+					am.responseMonitors[agentID] = stopCh
+					go am.monitorAgentResponse(agentID, stopCh)
+					
+					log.InfoLog.Printf("Loaded agent %s from storage with auto-monitoring", agentID)
+				} else {
+					log.InfoLog.Printf("Skipping reload of already tracked agent %s", agentID)
 				}
 			}
 		}
@@ -794,7 +1017,7 @@ func (am *AgentManager) loadInstancesFromStorage() error {
 	return nil
 }
 
-// deleteAgent removes an agent and cleans up all its resources
+// deleteAgent removes an agent using the same logic as the UI 'D' key
 func (am *AgentManager) deleteAgent(agentID string) (string, error) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
@@ -807,28 +1030,398 @@ func (am *AgentManager) deleteAgent(agentID string) (string, error) {
 
 	// Get the instance
 	instance, hasInstance := am.instances[agentID]
-	if hasInstance && instance != nil {
-		// Kill the instance (this will clean up tmux session and any worktree)
-		if err := instance.Kill(); err != nil {
-			log.ErrorLog.Printf("Failed to kill instance for agent %s: %v", agentID, err)
-			// Continue with deletion even if kill fails
-		}
+	if !hasInstance || instance == nil {
+		return "", fmt.Errorf("agent %s has no instance", agentID)
 	}
 
-	// Remove from storage
+	// Use the same deletion logic as the UI 'D' key:
+	// 1. Delete from storage first
 	if err := am.storage.DeleteInstance(agent.SessionID); err != nil {
-		log.ErrorLog.Printf("Failed to delete agent %s from storage: %v", agentID, err)
-		// Continue with in-memory cleanup even if storage deletion fails
+		return "", fmt.Errorf("failed to delete agent %s from storage: %w", agentID, err)
 	}
+
+	// 2. Kill the instance (same as m.list.Kill())
+	if err := instance.Kill(); err != nil {
+		log.ErrorLog.Printf("Failed to kill instance for agent %s: %v", agentID, err)
+		// Continue with cleanup even if kill fails
+	}
+
+	// Stop monitoring if running
+	if stopCh, exists := am.responseMonitors[agentID]; exists {
+		close(stopCh)
+		delete(am.responseMonitors, agentID)
+	}
+
+	// Clean up notification tracking
+	delete(am.lastNotifications, agentID)
+	delete(am.lastNotificationTime, agentID)
 
 	// Remove from in-memory tracking
 	delete(am.agents, agentID)
 	delete(am.instances, agentID)
 
-	// Update storage to reflect the removal
-	if err := am.saveInstancesToStorage(); err != nil {
-		log.ErrorLog.Printf("Failed to save updated instances after deleting agent %s: %v", agentID, err)
+	log.InfoLog.Printf("Deleted agent %s using UI deletion logic", agentID)
+	return fmt.Sprintf("Agent %s (session: %s) has been deleted successfully", agentID, agent.SessionID), nil
+}
+
+// forceCleanAgents removes all MCP agents from both tracking and storage
+func (am *AgentManager) forceCleanAgents() (string, error) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	// Kill all tracked agent instances
+	var killedAgents []string
+	for agentID, instance := range am.instances {
+		if instance != nil {
+			if err := instance.Kill(); err != nil {
+				log.ErrorLog.Printf("Failed to kill instance for agent %s: %v", agentID, err)
+			}
+		}
+		killedAgents = append(killedAgents, agentID)
 	}
 
-	return fmt.Sprintf("Agent %s (session: %s) has been deleted successfully", agentID, agent.SessionID), nil
+	// Clear all MCP tracking
+	am.agents = make(map[string]AgentInfo)
+	am.instances = make(map[string]*session.Instance)
+
+	// Load storage and remove all MCP agents
+	existingInstances, err := am.storage.LoadInstances()
+	if err != nil {
+		return "", fmt.Errorf("failed to load instances from storage: %w", err)
+	}
+
+	// Keep only non-MCP instances
+	var cleanInstances []*session.Instance
+	var removedTitles []string
+	for _, instance := range existingInstances {
+		if !strings.HasPrefix(instance.Title, "Agent-agent-") {
+			cleanInstances = append(cleanInstances, instance)
+		} else {
+			removedTitles = append(removedTitles, instance.Title)
+		}
+	}
+
+	// Save cleaned storage
+	if err := am.storage.SaveInstances(cleanInstances); err != nil {
+		return "", fmt.Errorf("failed to save cleaned instances: %w", err)
+	}
+
+	result := fmt.Sprintf("Force cleaned %d tracked agents and %d stored instances.\n", 
+		len(killedAgents), len(removedTitles))
+	result += fmt.Sprintf("Tracked agents removed: %v\n", killedAgents)
+	result += fmt.Sprintf("Storage instances removed: %v", removedTitles)
+
+	return result, nil
+}
+
+
+// monitorAgentResponse monitors an agent for completion indicators and sends responses
+func (am *AgentManager) monitorAgentResponse(agentID string, stopCh chan struct{}) {
+	sessionName := ""
+	var isNonInteractive bool
+	
+	// Get session name and mode
+	func() {
+		am.mu.RLock()
+		defer am.mu.RUnlock()
+		if agent, exists := am.agents[agentID]; exists {
+			sessionName = formatSessionName(agent.SessionID)
+			isNonInteractive = agent.NonInteractive
+		}
+	}()
+
+	if sessionName == "" {
+		log.ErrorLog.Printf("Could not find session name for agent %s", agentID)
+		return
+	}
+
+	mode := "non-interactive"
+	if !isNonInteractive {
+		mode = "interactive"
+	}
+	log.InfoLog.Printf("Starting auto-response monitoring for agent %s (session: %s, mode: %s)", agentID, sessionName, mode)
+
+	ticker := time.NewTicker(2 * time.Second) // Check every 2 seconds
+	defer ticker.Stop()
+
+	var wasResponding bool
+	var lastOutputHash string
+	var hasSeenResult bool // For non-interactive mode
+	var finalOutput string // Store final output for non-interactive mode
+
+	for {
+		select {
+		case <-stopCh:
+			log.InfoLog.Printf("Stopping auto-response monitoring for agent %s", agentID)
+			return
+		case <-ticker.C:
+			// Check if session still exists
+			checkCmd := exec.Command("tmux", "has-session", "-t", sessionName)
+			sessionExists := checkCmd.Run() == nil
+			
+			if !sessionExists {
+				// Session ended - for non-interactive mode, this means task completed
+				if isNonInteractive {
+					log.InfoLog.Printf("Agent %s session ended - task completed (non-interactive mode)", agentID)
+					am.updateAgentResponseState(agentID, false)
+					
+					// Try to get any remaining output from tmux history before it's completely gone
+					// This captures more than just the visible screen
+					historyCmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-")
+					if historyOutput, err := historyCmd.Output(); err == nil {
+						historyStr := string(historyOutput)
+						if len(historyStr) > len(finalOutput) && len(historyStr) > 1000 {
+							finalOutput = historyStr
+							log.InfoLog.Printf("Agent %s captured final history output (%d chars)", agentID, len(historyStr))
+						}
+					}
+					
+					// Save output to file for debugging and retrieval
+					tasksDir := "/tmp/tasks"
+					os.MkdirAll(tasksDir, 0755) // Create tasks directory if it doesn't exist
+					
+					// Use agent type and timestamp for filename
+					agent, _ := am.agents[agentID]
+					filename := fmt.Sprintf("%s-%s.txt", agent.AgentType, agentID)
+					outputFile := fmt.Sprintf("%s/%s", tasksDir, filename)
+					
+					if err := os.WriteFile(outputFile, []byte(finalOutput), 0644); err == nil {
+						log.InfoLog.Printf("Saved agent %s output to %s (%d chars)", agentID, outputFile, len(finalOutput))
+					}
+					
+					// Store final output for later retrieval and send notification
+					am.mu.Lock()
+					am.finalOutputs[agentID] = finalOutput
+					am.mu.Unlock()
+					
+					go func() {
+						time.Sleep(500 * time.Millisecond)
+						am.sendCompletionNotificationWithOutput(agentID, finalOutput)
+					}()
+				} else {
+					log.InfoLog.Printf("Agent %s session no longer exists, stopping monitor", agentID)
+				}
+				return
+			}
+
+			// Capture current output
+			cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-100")
+			output, err := cmd.Output()
+			if err != nil {
+				log.ErrorLog.Printf("Failed to capture output for agent %s: %v", agentID, err)
+				continue
+			}
+
+			outputStr := string(output)
+			
+			// Store output for potential use when session ends
+			// Only store if it contains actual results, not just the prompt we sent
+			if isNonInteractive && outputStr != "" {
+				// Check if this looks like actual agent output (contains result or substantial content)
+				if strings.Contains(outputStr, `{"type":"result"`) || 
+				   (!strings.Contains(outputStr, "IMPORTANT: This agent is being monitored") && len(outputStr) > 500) {
+					finalOutput = outputStr
+					log.InfoLog.Printf("Agent %s captured output (%d chars)", agentID, len(outputStr))
+				}
+			}
+			
+			// Different detection logic for interactive vs non-interactive modes
+			var isResponding bool
+			var isCompleted bool
+			
+			if isNonInteractive {
+				// Non-interactive mode: look for {"type":"result" pattern for completion
+				isResponding = !strings.Contains(outputStr, `{"type":"result"`)
+				isCompleted = strings.Contains(outputStr, `{"type":"result"`) && !hasSeenResult
+				if isCompleted {
+					hasSeenResult = true
+				}
+			} else {
+				// Interactive mode: look for "esc to interrupt" pattern
+				isResponding = strings.Contains(strings.ToLower(outputStr), "esc to interrupt")
+			}
+
+			// Detect state changes
+			stateChanged := false
+			if !wasResponding && isResponding {
+				// Agent started responding
+				log.InfoLog.Printf("Agent %s started responding (%s mode)", agentID, mode)
+				am.updateAgentResponseState(agentID, true)
+				stateChanged = true
+			} else if wasResponding && !isResponding {
+				// Agent finished responding - check if output actually changed
+				currentHash := am.hashString(outputStr)
+				if currentHash != lastOutputHash && lastOutputHash != "" {
+					log.InfoLog.Printf("Agent %s finished responding with new output (%s mode, hash: %s -> %s)", agentID, mode, lastOutputHash, currentHash)
+					am.updateAgentResponseState(agentID, false)
+					
+					// Send response back to orchestrator with delay to avoid race conditions
+					go func() {
+						time.Sleep(1 * time.Second) // Brief delay to ensure state is stable
+						am.sendCompletionNotification(agentID)
+					}()
+					stateChanged = true
+				}
+			} else if isNonInteractive && isCompleted {
+				// Non-interactive mode: immediate completion when result appears
+				log.InfoLog.Printf("Agent %s completed (non-interactive mode, found result)", agentID)
+				am.updateAgentResponseState(agentID, false)
+				
+				// Store final output for later retrieval
+				am.mu.Lock()
+				am.finalOutputs[agentID] = finalOutput
+				am.mu.Unlock()
+				
+				go func() {
+					time.Sleep(1 * time.Second)
+					am.sendCompletionNotificationWithOutput(agentID, finalOutput)
+				}()
+				stateChanged = true
+				// Exit monitoring loop since task is complete
+				return
+			}
+
+			if stateChanged || isResponding != wasResponding {
+				lastOutputHash = am.hashString(outputStr)
+			}
+
+			wasResponding = isResponding
+		}
+	}
+}
+
+// updateAgentResponseState updates the agent's responding state
+func (am *AgentManager) updateAgentResponseState(agentID string, isResponding bool) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	
+	if agent, exists := am.agents[agentID]; exists {
+		agent.IsResponding = isResponding
+		agent.LastActive = time.Now()
+		am.agents[agentID] = agent
+	}
+}
+
+// sendCompletionNotificationWithOutput sends the agent's response to the orchestrator with provided output
+func (am *AgentManager) sendCompletionNotificationWithOutput(agentID string, output string) {
+	// Check for duplicates and cooldown period
+	am.mu.Lock()
+	lastNotification, notificationExists := am.lastNotifications[agentID]
+	lastTime, timeExists := am.lastNotificationTime[agentID]
+	
+	// Prevent duplicates and rapid-fire notifications (minimum 5 seconds between notifications)
+	now := time.Now()
+	if notificationExists && lastNotification == output {
+		am.mu.Unlock()
+		log.InfoLog.Printf("Skipping exact duplicate notification for agent %s", agentID)
+		return
+	}
+	if timeExists && now.Sub(lastTime) < 5*time.Second {
+		am.mu.Unlock()
+		log.InfoLog.Printf("Skipping notification for agent %s (cooldown period)", agentID)
+		return
+	}
+	
+	// Store this notification as the last one sent
+	am.lastNotifications[agentID] = output
+	am.lastNotificationTime[agentID] = now
+	am.mu.Unlock()
+
+	// Send to main session (orchestrator) - use two commands with delay for large outputs
+	message := fmt.Sprintf("AGENT_COMPLETE:%s:%s", agentID, output)
+	
+	log.InfoLog.Printf("Sending completion notification text for agent %s (%d chars)", agentID, len(message))
+	cmd1 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", message)
+	if err := cmd1.Run(); err != nil {
+		log.ErrorLog.Printf("Failed to send completion notification to orchestrator: %v", err)
+		return
+	}
+
+	// Add delay based on message size - larger messages need more time to paste
+	delay := time.Duration(len(message)/1000+1) * time.Second
+	if delay > 5*time.Second {
+		delay = 5 * time.Second // Cap at 5 seconds max
+	}
+	log.InfoLog.Printf("Waiting %v before sending Enter for agent %s", delay, agentID)
+	time.Sleep(delay)
+
+	log.InfoLog.Printf("Sending Enter for completion notification for agent %s", agentID)
+	cmd2 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", "C-m")
+	if err := cmd2.Run(); err != nil {
+		log.ErrorLog.Printf("Failed to send enter for completion notification: %v", err)
+		return
+	}
+
+	log.InfoLog.Printf("Sent completion notification for agent %s to orchestrator", agentID)
+}
+
+// sendCompletionNotification sends the agent's response to the orchestrator
+func (am *AgentManager) sendCompletionNotification(agentID string) {
+	// Get the agent's latest response
+	output, err := am.getAgentOutput(agentID, "last_message", 1)
+	if err != nil {
+		log.ErrorLog.Printf("Failed to get output for completion notification from agent %s: %v", agentID, err)
+		return
+	}
+
+	// Check for duplicates and cooldown period
+	am.mu.Lock()
+	lastNotification, notificationExists := am.lastNotifications[agentID]
+	lastTime, timeExists := am.lastNotificationTime[agentID]
+	
+	// Prevent duplicates and rapid-fire notifications (minimum 5 seconds between notifications)
+	now := time.Now()
+	if notificationExists && lastNotification == output {
+		am.mu.Unlock()
+		log.InfoLog.Printf("Skipping exact duplicate notification for agent %s", agentID)
+		return
+	}
+	if timeExists && now.Sub(lastTime) < 5*time.Second {
+		am.mu.Unlock()
+		log.InfoLog.Printf("Skipping notification for agent %s (cooldown period)", agentID)
+		return
+	}
+	
+	// Store this notification as the last one sent
+	am.lastNotifications[agentID] = output
+	am.lastNotificationTime[agentID] = now
+	am.mu.Unlock()
+
+	// Send to main session (orchestrator)
+	message := fmt.Sprintf("AGENT_COMPLETE:%s:%s", agentID, output)
+	
+	cmd1 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", message)
+	if err := cmd1.Run(); err != nil {
+		log.ErrorLog.Printf("Failed to send completion notification to orchestrator: %v", err)
+		return
+	}
+
+	cmd2 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", "C-m")
+	if err := cmd2.Run(); err != nil {
+		log.ErrorLog.Printf("Failed to send enter for completion notification: %v", err)
+		return
+	}
+
+	log.InfoLog.Printf("Sent completion notification for agent %s to orchestrator", agentID)
+}
+
+// parseLastMessageFromOutput extracts the last message from stored output
+func (am *AgentManager) parseLastMessageFromOutput(output, agentID string) (string, error) {
+	// For non-interactive agents, the final output IS the last message
+	return fmt.Sprintf("Last message from agent %s:\\n%s", agentID, output), nil
+}
+
+// parseLastXMessagesFromOutput extracts the last X messages from stored output  
+func (am *AgentManager) parseLastXMessagesFromOutput(output, agentID string, count int) (string, error) {
+	// For non-interactive agents, we only have the final output, so return that
+	return fmt.Sprintf("Final output from agent %s:\\n%s", agentID, output), nil
+}
+
+// hashString creates a simple hash of a string for comparison
+func (am *AgentManager) hashString(s string) string {
+	// Remove whitespace and control characters for better comparison
+	cleaned := strings.ReplaceAll(s, " ", "")
+	cleaned = strings.ReplaceAll(cleaned, "\n", "")
+	cleaned = strings.ReplaceAll(cleaned, "\t", "")
+	return fmt.Sprintf("%x", len(cleaned)+len(s)) // Hash based on both cleaned length and original length
 }

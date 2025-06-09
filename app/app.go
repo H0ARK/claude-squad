@@ -8,8 +8,10 @@ import (
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -163,10 +165,11 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 }
 
 func (m *home) Init() tea.Cmd {
-	// Start spinner and initialize file watching for new instances
+	// Start spinner, file watching, and restore instance status polling
 	return tea.Batch(
 		m.spinner.Tick,
 		m.startFileWatcher(), // Watch for storage changes
+		tickUpdateMetadataCmd, // Restore polling for existing instance status
 	)
 }
 
@@ -191,6 +194,27 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			log.WarningLog.Printf("could not load new instances after storage change: %v", err)
 		}
 		return m, tea.Batch(m.instanceChanged(), m.startFileWatcher()) // Restart watcher
+	case tickUpdateMetadataMessage:
+		// Update existing instance status - this is what was missing!
+		for _, instance := range m.list.GetInstances() {
+			if !instance.Started() || instance.Paused() {
+				continue
+			}
+			updated, prompt := instance.HasUpdated()
+			if updated {
+				instance.SetStatus(session.Running)
+			} else {
+				if prompt {
+					instance.TapEnter()
+				} else {
+					instance.SetStatus(session.Ready)
+				}
+			}
+			if err := instance.UpdateDiffStats(); err != nil {
+				log.WarningLog.Printf("could not update diff stats: %v", err)
+			}
+		}
+		return m, tickUpdateMetadataCmd
 	case tea.MouseMsg:
 		// Handle mouse wheel scrolling in the diff view
 		if m.tabbedWindow.IsInDiffTab() {
@@ -408,7 +432,6 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 		instance, err := session.NewInstance(session.InstanceOptions{
 			Title:   "",
-			Path:    ".",
 			Program: m.program,
 		})
 		if err != nil {
@@ -429,7 +452,6 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 		instance, err := session.NewInstance(session.InstanceOptions{
 			Title:   "",
-			Path:    ".",
 			Program: m.program,
 		})
 		if err != nil {
@@ -465,8 +487,10 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	case keys.KeyKill:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil {
+			log.InfoLog.Printf("DELETE: No instance selected")
 			return m, nil
 		}
+		log.InfoLog.Printf("DELETE: Attempting to delete instance: %s", selected.Title)
 
 		// Check if instance has git worktree (agents might not)
 		worktree, err := selected.GetGitWorktree()
@@ -536,6 +560,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, m.handleError(err)
 		}
 		return m, tea.WindowSize()
+	case keys.KeyForceDelete:
+		// Force delete all persistent agents
+		return m, m.forceDeleteAgents()
 	case keys.KeyEnter:
 		if m.list.NumInstances() == 0 {
 			return m, nil
@@ -600,6 +627,9 @@ type forceRefreshMsg struct{}
 
 // storageChangedMsg implements tea.Msg and indicates storage file was modified
 type storageChangedMsg struct{}
+
+// tickUpdateMetadataMessage implements tea.Msg for instance status polling
+type tickUpdateMetadataMessage struct{}
 
 // handleError handles all errors which get bubbled up to the app. sets the error message. We return a callback tea.Cmd that returns a hideErrMsg message
 // which clears the error message after 3 seconds.
@@ -695,5 +725,94 @@ func (m *home) startFileWatcher() tea.Cmd {
 		// Very simple approach: check occasionally for changes
 		time.Sleep(3 * time.Second) // Wait a bit, then check
 		return storageChangedMsg{}
+	}
+}
+
+// tickUpdateMetadataCmd polls instance status every 500ms (original claude-squad behavior)
+var tickUpdateMetadataCmd = func() tea.Msg {
+	time.Sleep(500 * time.Millisecond) // Restore original 500ms polling
+	return tickUpdateMetadataMessage{}
+}
+
+// forceDeleteAgents manually removes all agent instances from storage and UI
+func (m *home) forceDeleteAgents() tea.Cmd {
+	return func() tea.Msg {
+		// Get config directory
+		configDir, err := config.GetConfigDir()
+		if err != nil {
+			log.ErrorLog.Printf("Failed to get config directory: %v", err)
+			return nil
+		}
+
+		// Read storage file directly
+		stateFilePath := filepath.Join(configDir, "state.json")
+		data, err := os.ReadFile(stateFilePath)
+		if err != nil {
+			log.ErrorLog.Printf("Failed to read state file: %v", err)
+			return nil
+		}
+
+		// Parse JSON
+		var state struct {
+			HelpScreensSeen int                `json:"help_screens_seen"`
+			Instances       []*session.Instance `json:"instances"`
+		}
+		if err := json.Unmarshal(data, &state); err != nil {
+			log.ErrorLog.Printf("Failed to parse state file: %v", err)
+			return nil
+		}
+
+		// Filter out all agent instances and kill them in the list
+		var cleanInstances []*session.Instance
+		var removedTitles []string
+		for _, instance := range state.Instances {
+			if !strings.HasPrefix(instance.Title, "Agent-agent-") {
+				cleanInstances = append(cleanInstances, instance)
+			} else {
+				removedTitles = append(removedTitles, instance.Title)
+				// Kill from UI list if present
+				for i, listInstance := range m.list.GetInstances() {
+					if listInstance.Title == instance.Title {
+						m.list.SetSelectedInstance(i)
+						m.list.Kill()
+						break
+					}
+				}
+			}
+		}
+
+		// Create new state
+		newState := struct {
+			HelpScreensSeen int                `json:"help_screens_seen"`
+			Instances       []*session.Instance `json:"instances"`
+		}{
+			HelpScreensSeen: state.HelpScreensSeen,
+			Instances:       cleanInstances,
+		}
+
+		// Write back to file
+		newData, err := json.MarshalIndent(newState, "", "  ")
+		if err != nil {
+			log.ErrorLog.Printf("Failed to marshal new state: %v", err)
+			return nil
+		}
+
+		// Backup original file first
+		backupPath := stateFilePath + ".backup"
+		if err := os.WriteFile(backupPath, data, 0644); err != nil {
+			log.ErrorLog.Printf("Failed to create backup: %v", err)
+		}
+
+		// Write new state
+		if err := os.WriteFile(stateFilePath, newData, 0644); err != nil {
+			log.ErrorLog.Printf("Failed to write new state file: %v", err)
+			return nil
+		}
+
+		log.InfoLog.Printf("FORCE DELETE: Removed %d agent instances: %v", len(removedTitles), removedTitles)
+		log.InfoLog.Printf("FORCE DELETE: Preserved %d non-agent instances", len(cleanInstances))
+		log.InfoLog.Printf("FORCE DELETE: Backup saved to: %s", backupPath)
+
+		return forceRefreshMsg{}
 	}
 }

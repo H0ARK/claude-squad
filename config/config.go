@@ -95,3 +95,16 @@ func saveConfig(config *Config) error {
 func SaveConfig(config *Config) error {
 	return saveConfig(config)
 }
+
+// Global variable to store the root git repository directory
+var RootDirectory string
+
+// SetRootDirectory sets the global root directory
+func SetRootDirectory(path string) {
+	RootDirectory = path
+}
+
+// GetRootDirectory returns the global root directory
+func GetRootDirectory() string {
+	return RootDirectory
+}

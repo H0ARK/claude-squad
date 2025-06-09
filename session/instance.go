@@ -1,6 +1,7 @@
 package session
 
 import (
+	"claude-squad/config"
 	"claude-squad/log"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
@@ -155,8 +156,14 @@ type InstanceOptions struct {
 func NewInstance(opts InstanceOptions) (*Instance, error) {
 	t := time.Now()
 
+	// Use global root directory if no path provided
+	path := opts.Path
+	if path == "" {
+		path = config.GetRootDirectory()
+	}
+
 	// Convert path to absolute
-	absPath, err := filepath.Abs(opts.Path)
+	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path: %w", err)
 	}
