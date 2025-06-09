@@ -53,7 +53,7 @@ func CreateMCPServer() *server.MCPServer {
 			mcp.Description("Description of the task for the new agent"),
 		),
 		mcp.WithString("program",
-			mcp.Description("Program to run (default: 'claude-code')"),
+			mcp.Description("Program to run (default: 'claude -p')"),
 		),
 	)
 
@@ -63,7 +63,7 @@ func CreateMCPServer() *server.MCPServer {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		program := request.GetString("program", "claude-code")
+		program := request.GetString("program", "claude -p")
 
 		result, err := agentManager.launchAgent(task, program)
 		if err != nil {
@@ -152,8 +152,10 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 	agentID := fmt.Sprintf("agent-%d", time.Now().Unix())
 	sessionID := fmt.Sprintf("claude-squad-%s", agentID)
 
-	// Create tmux session
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionID, program)
+	// Create tmux session with task as part of the command
+	// Format: tmux new-session -d -s sessionID claude -p "task"
+	fullCommand := fmt.Sprintf("%s \"%s\"", program, task)
+	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionID, "sh", "-c", fullCommand)
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to create tmux session: %w", err)
 	}
@@ -208,8 +210,9 @@ func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
 		return "", fmt.Errorf("agent %s not found", agentID)
 	}
 
-	// Send message to tmux session (two-step: text first, then enter)
-	cmd1 := exec.Command("tmux", "send-keys", "-t", agent.SessionID, message)
+	// Send message to tmux session using claude --continue (two-step: text first, then enter)
+	continueCommand := fmt.Sprintf("claude -p --continue \"%s\"", message)
+	cmd1 := exec.Command("tmux", "send-keys", "-t", agent.SessionID, continueCommand)
 	if err := cmd1.Run(); err != nil {
 		return "", fmt.Errorf("failed to send message to agent %s: %w", agentID, err)
 	}
