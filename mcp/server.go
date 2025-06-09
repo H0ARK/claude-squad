@@ -17,14 +17,12 @@ import (
 
 // Agent management types
 type AgentInfo struct {
-	ID                  string    `json:"id"`
-	SessionID           string    `json:"session_id"`
-	Task                string    `json:"task,omitempty"`
-	Status              string    `json:"status"`
-	CreatedAt           time.Time `json:"created_at"`
-	LastActive          time.Time `json:"last_active"`
-	AutoRespond         bool      `json:"auto_respond"`
-	OrchestratorSession string    `json:"orchestrator_session"`
+	ID         string    `json:"id"`
+	SessionID  string    `json:"session_id"`
+	Task       string    `json:"task,omitempty"`
+	Status     string    `json:"status"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastActive time.Time `json:"last_active"`
 }
 
 type AgentManager struct {
@@ -203,31 +201,42 @@ func CreateMCPServer() *server.MCPServer {
 		return mcp.NewToolResultText(fmt.Sprintf("Sent output from agent %s to main session", agentID)), nil
 	})
 
-	// Add auto_respond tool for automatic responses to orchestrator
-	autoRespondTool := mcp.NewTool("auto_respond",
-		mcp.WithDescription("Enable/disable automatic response to orchestrator when task is completed"),
+	// Add debug_tmux tool for troubleshooting
+	debugTmuxTool := mcp.NewTool("debug_tmux",
+		mcp.WithDescription("Debug tmux sessions - list all sessions and check agent session status"),
+	)
+
+	s.AddTool(debugTmuxTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		result := agentManager.debugTmuxSessions()
+		return mcp.NewToolResultText(result), nil
+	})
+
+	// Add check_ui_state tool for troubleshooting UI issues
+	checkUITool := mcp.NewTool("check_ui_state",
+		mcp.WithDescription("Check the current state of the claude-squad UI to debug instance creation issues"),
+	)
+
+	s.AddTool(checkUITool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		result := agentManager.checkUIState()
+		return mcp.NewToolResultText(result), nil
+	})
+
+	// Add delete_agent tool
+	deleteAgentTool := mcp.NewTool("delete_agent",
+		mcp.WithDescription("Delete an agent and clean up its tmux session and worktree"),
 		mcp.WithString("agent_id",
 			mcp.Required(),
-			mcp.Description("ID of the agent to configure auto-response for"),
-		),
-		mcp.WithBoolean("enabled",
-			mcp.Description("Whether to enable auto-response (default: true)"),
-		),
-		mcp.WithString("orchestrator_session",
-			mcp.Description("Target session for responses (default: 'claudesquad_orc')"),
+			mcp.Description("ID of the agent to delete"),
 		),
 	)
 
-	s.AddTool(autoRespondTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.AddTool(deleteAgentTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		agentID, err := request.RequireString("agent_id")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		enabled := request.GetBool("enabled", true)
-		orchestratorSession := request.GetString("orchestrator_session", "claudesquad_orc")
-
-		result, err := agentManager.setAutoResponse(agentID, enabled, orchestratorSession)
+		result, err := agentManager.deleteAgent(agentID)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -244,76 +253,72 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 	agentID := fmt.Sprintf("agent-%d", time.Now().Unix())
 	title := fmt.Sprintf("Agent-%s", agentID)
 
-	// Instead of creating a new instance, connect to existing claude-squad
-	// by launching a new session in the current claude-squad instance
+	// Bypass UI - create instance directly using claude-squad's session.NewInstance
 	actualProgram := "claude"
 	if program != "" && program != "claude-squad" && program != "./claude-squad" {
 		actualProgram = program
 	}
 	
-	log.InfoLog.Printf("Creating agent %s as new session with program '%s' (requested: '%s')", agentID, actualProgram, program)
+	log.InfoLog.Printf("Creating agent %s directly (bypassing UI) with program '%s'", agentID, actualProgram)
 	
+	// Create instance using claude-squad's proper instance creation
 	instance, err := session.NewInstance(session.InstanceOptions{
 		Title:   title,
 		Path:    ".",
 		Program: actualProgram,
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to create instance: %w", err)
+		return "", fmt.Errorf("failed to create agent instance: %w", err)
 	}
 
-	// Start the instance (this creates the tmux session and shows in UI)
+	// Start the instance - this will create the tmux session and git worktree properly
 	if err := instance.Start(true); err != nil {
-		return "", fmt.Errorf("failed to start instance: %w", err)
+		return "", fmt.Errorf("failed to start agent instance: %w", err)
 	}
 
-	// Wait a moment for Claude Code to start up and show trust prompt
-	time.Sleep(2 * time.Second)
+	// Store agent info for tracking
+	am.mu.Lock()
+	am.agents[agentID] = AgentInfo{
+		ID:         agentID,
+		SessionID:  title, // Use title as session identifier
+		Task:       task,
+		Status:     "active",
+		CreatedAt:  time.Now(),
+		LastActive: time.Now(),
+	}
+	am.instances[agentID] = instance
+	am.mu.Unlock()
+
+	// Save to storage so it appears in UI immediately
+	if err := am.saveInstancesToStorage(); err != nil {
+		log.ErrorLog.Printf("Failed to save agent to storage: %v", err)
+	} else {
+		log.InfoLog.Printf("Saved agent %s to storage for UI sync", agentID)
+	}
+
+	// Wait for Claude Code to start and show trust prompt
+	time.Sleep(3 * time.Second)
 	
 	// Auto-accept trust prompt by sending "1"
 	if err := instance.SendPrompt("1"); err != nil {
 		log.ErrorLog.Printf("Failed to send trust response to agent %s: %v", agentID, err)
-		// Don't kill on trust failure, continue
 	} else {
 		log.InfoLog.Printf("Sent trust response to agent %s", agentID)
 	}
 	
 	// Wait for trust to be processed
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 	
 	// Send the initial task as a prompt to the agent
 	if task != "" {
 		if err := instance.SendPrompt(task); err != nil {
 			log.ErrorLog.Printf("Failed to send initial prompt to agent %s: %v", agentID, err)
-			instance.Kill()
-			return "", fmt.Errorf("failed to send initial prompt to agent %s: %w", agentID, err)
+		} else {
+			log.InfoLog.Printf("Sent initial prompt to agent %s: %s", agentID, task)
 		}
-		log.InfoLog.Printf("Sent initial prompt to agent %s: %s", agentID, task)
 	}
 
-	// Store agent info
-	am.mu.Lock()
-	am.agents[agentID] = AgentInfo{
-		ID:                  agentID,
-		SessionID:           title, // Use title as session identifier
-		Task:                task,
-		Status:              "active",
-		CreatedAt:           time.Now(),
-		LastActive:          time.Now(),
-		AutoRespond:         true,                // Enable auto-respond by default
-		OrchestratorSession: "claudesquad_orc",  // Default orchestrator session
-	}
-	am.instances[agentID] = instance
-	am.mu.Unlock()
-
-	// Save instance to shared storage so it appears in main UI
-	if err := am.saveInstancesToStorage(); err != nil {
-		log.ErrorLog.Printf("Failed to save instances to storage: %v", err)
-	} else {
-		log.InfoLog.Printf("Successfully saved agent %s to storage for UI sync", agentID)
-	}
-
-	return fmt.Sprintf("Agent %s created as new session '%s' with task: %s", agentID, title, task), nil
+	return fmt.Sprintf("Agent %s created directly (bypassing UI) with task: %s", agentID, task), nil
 }
 
 func (am *AgentManager) listAgents() string {
@@ -371,14 +376,20 @@ func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
 	// Use the formatted session name
 	sessionName := formatSessionName(instance.Title)
 
+	// First verify the session exists
+	checkCmd := exec.Command("tmux", "has-session", "-t", sessionName)
+	if err := checkCmd.Run(); err != nil {
+		return "", fmt.Errorf("agent %s session %s does not exist", agentID, sessionName)
+	}
+
 	cmd1 := exec.Command("tmux", "send-keys", "-t", sessionName, message)
 	if err := cmd1.Run(); err != nil {
-		return "", fmt.Errorf("failed to send message to agent %s: %w", agentID, err)
+		return "", fmt.Errorf("failed to send message to agent %s (session: %s): %w", agentID, sessionName, err)
 	}
 
 	cmd2 := exec.Command("tmux", "send-keys", "-t", sessionName, "C-m")
 	if err := cmd2.Run(); err != nil {
-		return "", fmt.Errorf("failed to send enter to agent %s: %w", agentID, err)
+		return "", fmt.Errorf("failed to send enter to agent %s (session: %s): %w", agentID, sessionName, err)
 	}
 
 	// Update last active time
@@ -386,11 +397,6 @@ func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
 	agent.LastActive = time.Now()
 	am.agents[agentID] = agent
 	am.mu.Unlock()
-
-	// Trigger auto-response check if enabled
-	if agent.AutoRespond {
-		am.checkForTaskCompletion(agentID)
-	}
 
 	return fmt.Sprintf("Message sent to agent %s: %s", agentID, message), nil
 }
@@ -415,11 +421,17 @@ func (am *AgentManager) getAgentOutput(agentID string, mode string, count int) (
 	case "raw_lines":
 		fallthrough
 	default:
+		// First verify the session exists
+		checkCmd := exec.Command("tmux", "has-session", "-t", sessionName)
+		if err := checkCmd.Run(); err != nil {
+			return "", fmt.Errorf("agent %s session %s does not exist", agentID, sessionName)
+		}
+		
 		// Capture tmux pane output
 		cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", fmt.Sprintf("-%d", count))
 		output, err := cmd.Output()
 		if err != nil {
-			return "", fmt.Errorf("failed to capture output from agent %s: %w", agentID, err)
+			return "", fmt.Errorf("failed to capture output from agent %s (session: %s): %w", agentID, sessionName, err)
 		}
 		return fmt.Sprintf("Output from agent %s (last %d lines):\n%s", agentID, count, string(output)), nil
 	}
@@ -427,11 +439,17 @@ func (am *AgentManager) getAgentOutput(agentID string, mode string, count int) (
 
 // getLastAgentMessage extracts the last complete message from the agent
 func (am *AgentManager) getLastAgentMessage(sessionName, agentID string) (string, error) {
+	// First verify the session exists
+	checkCmd := exec.Command("tmux", "has-session", "-t", sessionName)
+	if err := checkCmd.Run(); err != nil {
+		return "", fmt.Errorf("agent %s session %s does not exist", agentID, sessionName)
+	}
+	
 	// Get more lines to ensure we capture complete messages
 	cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-200")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to capture output from agent %s: %w", agentID, err)
+		return "", fmt.Errorf("failed to capture output from agent %s (session: %s): %w", agentID, sessionName, err)
 	}
 
 	lines := strings.Split(string(output), "\n")
@@ -509,11 +527,17 @@ func (am *AgentManager) getLastAgentMessage(sessionName, agentID string) (string
 
 // getLastXAgentMessages extracts the last X complete messages from the agent
 func (am *AgentManager) getLastXAgentMessages(sessionName, agentID string, count int) (string, error) {
+	// First verify the session exists
+	checkCmd := exec.Command("tmux", "has-session", "-t", sessionName)
+	if err := checkCmd.Run(); err != nil {
+		return "", fmt.Errorf("agent %s session %s does not exist", agentID, sessionName)
+	}
+	
 	// Get more lines to ensure we capture complete messages
 	cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-300")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to capture output from agent %s: %w", agentID, err)
+		return "", fmt.Errorf("failed to capture output from agent %s (session: %s): %w", agentID, sessionName, err)
 	}
 
 	lines := strings.Split(string(output), "\n")
@@ -597,7 +621,7 @@ func (am *AgentManager) sendOutputToMain(agentID string) error {
 	}
 
 	// Send to main session (claudesquad_orc)
-	cmd1 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", fmt.Sprintf("Agent %s completed task. %s", agentID, output))
+	cmd1 := exec.Command("tmux", "send-keys", "-t", "claudesquad_orc", fmt.Sprintf("Agent %s output: %s", agentID, output))
 	if err := cmd1.Run(); err != nil {
 		return fmt.Errorf("failed to send output to main: %w", err)
 	}
@@ -610,90 +634,84 @@ func (am *AgentManager) sendOutputToMain(agentID string) error {
 	return nil
 }
 
-// setAutoResponse configures automatic response settings for an agent
-func (am *AgentManager) setAutoResponse(agentID string, enabled bool, orchestratorSession string) (string, error) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	agent, exists := am.agents[agentID]
-	if !exists {
-		return "", fmt.Errorf("agent %s not found", agentID)
+// debugTmuxSessions provides debug information about tmux sessions
+func (am *AgentManager) debugTmuxSessions() string {
+	var result strings.Builder
+	result.WriteString("=== TMUX SESSION DEBUG ===\n\n")
+	
+	// List all tmux sessions
+	cmd := exec.Command("tmux", "list-sessions")
+	output, err := cmd.Output()
+	if err != nil {
+		result.WriteString(fmt.Sprintf("Failed to list tmux sessions: %v\n", err))
+	} else {
+		result.WriteString("All tmux sessions:\n")
+		result.WriteString(string(output))
+		result.WriteString("\n")
 	}
-
-	agent.AutoRespond = enabled
-	agent.OrchestratorSession = orchestratorSession
-	am.agents[agentID] = agent
-
-	status := "disabled"
-	if enabled {
-		status = "enabled"
+	
+	// Check each tracked agent
+	am.mu.RLock()
+	result.WriteString(fmt.Sprintf("Tracked agents: %d\n", len(am.agents)))
+	for agentID, agent := range am.agents {
+		sessionName := formatSessionName(agent.SessionID)
+		result.WriteString(fmt.Sprintf("\nAgent: %s\n", agentID))
+		result.WriteString(fmt.Sprintf("  Title: %s\n", agent.SessionID))
+		result.WriteString(fmt.Sprintf("  Expected session: %s\n", sessionName))
+		
+		// Check if session exists
+		checkCmd := exec.Command("tmux", "has-session", "-t", sessionName)
+		if err := checkCmd.Run(); err != nil {
+			result.WriteString(fmt.Sprintf("  Status: ❌ Session does not exist\n"))
+		} else {
+			result.WriteString(fmt.Sprintf("  Status: ✅ Session exists\n"))
+			
+			// Try to get session info
+			infoCmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{session_name}:#{window_name}:#{pane_current_command}")
+			if infoOutput, err := infoCmd.Output(); err == nil {
+				result.WriteString(fmt.Sprintf("  Info: %s\n", strings.TrimSpace(string(infoOutput))))
+			}
+		}
 	}
-
-	return fmt.Sprintf("Auto-response %s for agent %s (target: %s)", status, agentID, orchestratorSession), nil
+	am.mu.RUnlock()
+	
+	return result.String()
 }
 
-// checkForTaskCompletion monitors an agent for task completion and sends auto-response
-func (am *AgentManager) checkForTaskCompletion(agentID string) {
-	go func() {
-		// Wait a bit for the message to be processed
-		time.Sleep(3 * time.Second)
-
-		am.mu.RLock()
-		agent, exists := am.agents[agentID]
-		am.mu.RUnlock()
-
-		if !exists || !agent.AutoRespond {
-			return
-		}
-
-		// Get the latest output to see if task appears complete
-		output, err := am.getAgentOutput(agentID, "last_message", 1)
-		if err != nil {
-			log.ErrorLog.Printf("Failed to check completion for agent %s: %v", agentID, err)
-			return
-		}
-
-		// Simple heuristic: if the output doesn't contain "thinking" or "working" indicators,
-		// and contains completion indicators, consider it done
-		outputLower := strings.ToLower(output)
-		completionIndicators := []string{"completed", "done", "finished", "ready", "result:", "output:", "here"}
-		workingIndicators := []string{"thinking", "working", "processing", "analyzing", "let me", "i'll", "i will"}
-
-		hasCompletion := false
-		for _, indicator := range completionIndicators {
-			if strings.Contains(outputLower, indicator) {
-				hasCompletion = true
-				break
-			}
-		}
-
-		hasWorking := false
-		for _, indicator := range workingIndicators {
-			if strings.Contains(outputLower, indicator) {
-				hasWorking = true
-				break
-			}
-		}
-
-		if hasCompletion && !hasWorking {
-			// Send auto-response to orchestrator
-			message := fmt.Sprintf("Agent %s has completed its task: %s", agentID, output)
-			
-			cmd1 := exec.Command("tmux", "send-keys", "-t", agent.OrchestratorSession, message)
-			if err := cmd1.Run(); err != nil {
-				log.ErrorLog.Printf("Failed to send auto-response to %s: %v", agent.OrchestratorSession, err)
-				return
-			}
-
-			cmd2 := exec.Command("tmux", "send-keys", "-t", agent.OrchestratorSession, "C-m")
-			if err := cmd2.Run(); err != nil {
-				log.ErrorLog.Printf("Failed to send enter for auto-response: %v", err)
-				return
-			}
-
-			log.InfoLog.Printf("Sent auto-response for agent %s to %s", agentID, agent.OrchestratorSession)
-		}
-	}()
+// checkUIState captures the current claude-squad UI state for debugging
+func (am *AgentManager) checkUIState() string {
+	var result strings.Builder
+	result.WriteString("=== CLAUDE-SQUAD UI STATE ===\n\n")
+	
+	// Check if the main session exists
+	checkCmd := exec.Command("tmux", "has-session", "-t", "claudesquad_orc")
+	if err := checkCmd.Run(); err != nil {
+		result.WriteString("❌ Main claude-squad session 'claudesquad_orc' does not exist\n")
+		return result.String()
+	}
+	
+	result.WriteString("✅ Main claude-squad session 'claudesquad_orc' exists\n\n")
+	
+	// Capture current screen content
+	captureCmd := exec.Command("tmux", "capture-pane", "-t", "claudesquad_orc", "-p")
+	output, err := captureCmd.Output()
+	if err != nil {
+		result.WriteString(fmt.Sprintf("Failed to capture UI state: %v\n", err))
+	} else {
+		result.WriteString("Current UI content:\n")
+		result.WriteString("---\n")
+		result.WriteString(string(output))
+		result.WriteString("---\n\n")
+	}
+	
+	// Get session info
+	infoCmd := exec.Command("tmux", "display-message", "-t", "claudesquad_orc", "-p", 
+		"Session: #{session_name}, Window: #{window_name}, Pane: #{pane_current_command}")
+	if infoOutput, err := infoCmd.Output(); err == nil {
+		result.WriteString(fmt.Sprintf("Session info: %s\n", strings.TrimSpace(string(infoOutput))))
+	}
+	
+	return result.String()
 }
 
 // saveInstancesToStorage saves all current instances to the shared storage
@@ -762,18 +780,55 @@ func (am *AgentManager) loadInstancesFromStorage() error {
 				agentID := strings.Join(parts[1:], "-") // agent-1234567890
 				am.instances[agentID] = instance
 				am.agents[agentID] = AgentInfo{
-					ID:                  agentID,
-					SessionID:           instance.Title,
-					Task:                "", // Task info is lost on reload
-					Status:              "active",
-					CreatedAt:           instance.CreatedAt,
-					LastActive:          instance.UpdatedAt,
-					AutoRespond:         true,                // Default to enabled for loaded agents
-					OrchestratorSession: "claudesquad_orc",  // Default orchestrator session
+					ID:         agentID,
+					SessionID:  instance.Title,
+					Task:       "", // Task info is lost on reload
+					Status:     "active",
+					CreatedAt:  instance.CreatedAt,
+					LastActive: instance.UpdatedAt,
 				}
 			}
 		}
 	}
 
 	return nil
+}
+
+// deleteAgent removes an agent and cleans up all its resources
+func (am *AgentManager) deleteAgent(agentID string) (string, error) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	// Check if agent exists
+	agent, exists := am.agents[agentID]
+	if !exists {
+		return "", fmt.Errorf("agent %s not found", agentID)
+	}
+
+	// Get the instance
+	instance, hasInstance := am.instances[agentID]
+	if hasInstance && instance != nil {
+		// Kill the instance (this will clean up tmux session and any worktree)
+		if err := instance.Kill(); err != nil {
+			log.ErrorLog.Printf("Failed to kill instance for agent %s: %v", agentID, err)
+			// Continue with deletion even if kill fails
+		}
+	}
+
+	// Remove from storage
+	if err := am.storage.DeleteInstance(agent.SessionID); err != nil {
+		log.ErrorLog.Printf("Failed to delete agent %s from storage: %v", agentID, err)
+		// Continue with in-memory cleanup even if storage deletion fails
+	}
+
+	// Remove from in-memory tracking
+	delete(am.agents, agentID)
+	delete(am.instances, agentID)
+
+	// Update storage to reflect the removal
+	if err := am.saveInstancesToStorage(); err != nil {
+		log.ErrorLog.Printf("Failed to save updated instances after deleting agent %s: %v", agentID, err)
+	}
+
+	return fmt.Sprintf("Agent %s (session: %s) has been deleted successfully", agentID, agent.SessionID), nil
 }

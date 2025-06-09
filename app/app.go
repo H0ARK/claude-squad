@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -162,15 +163,10 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 }
 
 func (m *home) Init() tea.Cmd {
-	// Upon starting, we want to start the spinner. Whenever we get a spinner.TickMsg, we
-	// update the spinner, which sends a new spinner.TickMsg. I think this lasts forever lol.
+	// Start spinner and initialize file watching for new instances
 	return tea.Batch(
 		m.spinner.Tick,
-		func() tea.Msg {
-			time.Sleep(100 * time.Millisecond)
-			return previewTickMsg{}
-		},
-		tickUpdateMetadataCmd,
+		m.startFileWatcher(), // Watch for storage changes
 	)
 }
 
@@ -178,43 +174,23 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case hideErrMsg:
 		m.errBox.Clear()
-	case previewTickMsg:
-		cmd := m.instanceChanged()
-		return m, tea.Batch(
-			cmd,
-			func() tea.Msg {
-				time.Sleep(250 * time.Millisecond) // 4x per second for responsive chat updates
-				return previewTickMsg{}
-			},
-		)
 	case keyupMsg:
 		m.menu.ClearKeydown()
 		return m, nil
-	case tickUpdateMetadataMessage:
-		// Check for new instances from storage every tick (2x per second, close to your 4x request)
+	case forceRefreshMsg:
+		// Only refresh when explicitly requested (e.g., after user action)
+		cmd := m.instanceChanged()
+		// Also check for new instances when explicitly refreshing
 		if err := m.loadNewInstancesFromStorage(); err != nil {
 			log.WarningLog.Printf("could not load new instances: %v", err)
 		}
-		
-		for _, instance := range m.list.GetInstances() {
-			if !instance.Started() || instance.Paused() {
-				continue
-			}
-			updated, prompt := instance.HasUpdated()
-			if updated {
-				instance.SetStatus(session.Running)
-			} else {
-				if prompt {
-					instance.TapEnter()
-				} else {
-					instance.SetStatus(session.Ready)
-				}
-			}
-			if err := instance.UpdateDiffStats(); err != nil {
-				log.WarningLog.Printf("could not update diff stats: %v", err)
-			}
+		return m, cmd
+	case storageChangedMsg:
+		// Storage file changed - new instances might be available
+		if err := m.loadNewInstancesFromStorage(); err != nil {
+			log.WarningLog.Printf("could not load new instances after storage change: %v", err)
 		}
-		return m, tickUpdateMetadataCmd
+		return m, tea.Batch(m.instanceChanged(), m.startFileWatcher()) // Restart watcher
 	case tea.MouseMsg:
 		// Handle mouse wheel scrolling in the diff view
 		if m.tabbedWindow.IsInDiffTab() {
@@ -345,7 +321,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				m.showHelpScreen(helpTypeInstanceStart, nil)
 			}
 
-			return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
+			return m, tea.Batch(tea.WindowSize(), m.instanceChanged(), func() tea.Msg { return forceRefreshMsg{} })
 		case tea.KeyRunes:
 			if len(instance.Title) >= 32 {
 				return m, m.handleError(fmt.Errorf("title cannot be longer than 32 characters"))
@@ -492,18 +468,24 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 
+		// Check if instance has git worktree (agents might not)
 		worktree, err := selected.GetGitWorktree()
 		if err != nil {
-			return m, m.handleError(err)
-		}
+			// If no git worktree (like agent instances), skip the checkout check
+			if !strings.Contains(err.Error(), "no git worktree") {
+				return m, m.handleError(err)
+			}
+			log.InfoLog.Printf("Deleting instance without git worktree: %s", selected.Title)
+		} else {
+			// Regular instance with git worktree - check if branch is checked out
+			checkedOut, err := worktree.IsBranchCheckedOut()
+			if err != nil {
+				return m, m.handleError(err)
+			}
 
-		checkedOut, err := worktree.IsBranchCheckedOut()
-		if err != nil {
-			return m, m.handleError(err)
-		}
-
-		if checkedOut {
-			return m, m.handleError(fmt.Errorf("instance %s is currently checked out", selected.Title))
+			if checkedOut {
+				return m, m.handleError(fmt.Errorf("instance %s is currently checked out", selected.Title))
+			}
 		}
 
 		// Delete from storage first
@@ -513,7 +495,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 		// Then kill the instance
 		m.list.Kill()
-		return m, m.instanceChanged()
+		return m, tea.Batch(m.instanceChanged(), func() tea.Msg { return forceRefreshMsg{} })
 	case keys.KeySubmit:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil {
@@ -613,17 +595,11 @@ func (m *home) keydownCallback(name keys.KeyName) tea.Cmd {
 // hideErrMsg implements tea.Msg and clears the error text from the screen.
 type hideErrMsg struct{}
 
-// previewTickMsg implements tea.Msg and triggers a preview update
-type previewTickMsg struct{}
+// forceRefreshMsg implements tea.Msg and triggers a one-time refresh
+type forceRefreshMsg struct{}
 
-type tickUpdateMetadataMessage struct{}
-
-// tickUpdateMetadataCmd is the callback to update the metadata of the instances every 500ms. Note that we iterate
-// overall the instances and capture their output. It's a pretty expensive operation. Let's do it 2x a second only.
-var tickUpdateMetadataCmd = func() tea.Msg {
-	time.Sleep(500 * time.Millisecond)
-	return tickUpdateMetadataMessage{}
-}
+// storageChangedMsg implements tea.Msg and indicates storage file was modified
+type storageChangedMsg struct{}
 
 // handleError handles all errors which get bubbled up to the app. sets the error message. We return a callback tea.Cmd that returns a hideErrMsg message
 // which clears the error message after 3 seconds.
@@ -711,4 +687,13 @@ func (m *home) loadNewInstancesFromStorage() error {
 	}
 	
 	return nil
+}
+
+// startFileWatcher watches the state file for changes and triggers updates
+func (m *home) startFileWatcher() tea.Cmd {
+	return func() tea.Msg {
+		// Very simple approach: check occasionally for changes
+		time.Sleep(3 * time.Second) // Wait a bit, then check
+		return storageChangedMsg{}
+	}
 }

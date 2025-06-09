@@ -339,11 +339,47 @@ func (i *Instance) GetGitWorktree() (*git.GitWorktree, error) {
 	if !i.started {
 		return nil, fmt.Errorf("cannot get git worktree for instance that has not been started")
 	}
+	if i.gitWorktree == nil {
+		return nil, fmt.Errorf("instance %s has no git worktree (may be an agent instance)", i.Title)
+	}
 	return i.gitWorktree, nil
 }
 
 func (i *Instance) Started() bool {
 	return i.started
+}
+
+// StartAgent starts an instance as an agent without git worktree setup
+func (i *Instance) StartAgent() error {
+	if i.Title == "" {
+		return fmt.Errorf("instance title cannot be empty")
+	}
+
+	tmuxSession := tmux.NewTmuxSession(i.Title, i.Program)
+	i.tmuxSession = tmuxSession
+
+	// No git worktree setup for agents - they work in the current directory
+
+	// Setup error handler to cleanup resources on any error
+	var setupErr error
+	defer func() {
+		if setupErr != nil {
+			if cleanupErr := i.Kill(); cleanupErr != nil {
+				setupErr = fmt.Errorf("%v (cleanup error: %v)", setupErr, cleanupErr)
+			}
+		} else {
+			i.started = true
+		}
+	}()
+
+	// Create new tmux session for agent (no git worktree path)
+	if err := i.tmuxSession.Start(i.Program, i.Path); err != nil {
+		setupErr = fmt.Errorf("failed to start agent session: %w", err)
+		return setupErr
+	}
+
+	i.SetStatus(Running)
+	return nil
 }
 
 // SetTitle sets the title of the instance. Returns an error if the instance has started.
@@ -473,6 +509,12 @@ func (i *Instance) UpdateDiffStats() error {
 
 	if i.Status == Paused {
 		// Keep the previous diff stats if the instance is paused
+		return nil
+	}
+
+	// Skip diff stats for instances without git worktree (like agents)
+	if i.gitWorktree == nil {
+		i.diffStats = nil
 		return nil
 	}
 
