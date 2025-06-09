@@ -201,11 +201,19 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 	agentID := fmt.Sprintf("agent-%d", time.Now().Unix())
 	title := fmt.Sprintf("Agent-%s", agentID)
 
-	// Create new claude-squad instance
+	// Instead of creating a new instance, connect to existing claude-squad
+	// by launching a new session in the current claude-squad instance
+	actualProgram := "claude"
+	if program != "" && program != "claude-squad" && program != "./claude-squad" {
+		actualProgram = program
+	}
+	
+	log.InfoLog.Printf("Creating agent %s as new session with program '%s' (requested: '%s')", agentID, actualProgram, program)
+	
 	instance, err := session.NewInstance(session.InstanceOptions{
 		Title:   title,
 		Path:    ".",
-		Program: program,
+		Program: actualProgram,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create instance: %w", err)
@@ -244,7 +252,7 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 		log.ErrorLog.Printf("Failed to save instances to storage: %v", err)
 	}
 
-	return fmt.Sprintf("Agent %s launched successfully as claude-squad instance '%s' with task: %s", agentID, title, task), nil
+	return fmt.Sprintf("Agent %s created as new session '%s' with task: %s", agentID, title, task), nil
 }
 
 func (am *AgentManager) listAgents() string {

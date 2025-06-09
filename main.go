@@ -62,6 +62,11 @@ var (
 			if autoYesFlag {
 				autoYes = true
 			}
+
+			if mcpFlag {
+				log.Initialize(true) // Enable logging for MCP mode
+				return app.RunWithMCP(ctx, program, autoYes)
+			}
 			if autoYes {
 				defer func() {
 					if err := daemon.LaunchDaemon(); err != nil {
@@ -176,6 +181,10 @@ func main() {
 
 			// Run as MCP server using mark3labs/mcp-go
 			mcpServer := mcp.CreateMCPServer()
+			if mcpServer == nil {
+				fmt.Fprintf(os.Stderr, "Failed to create MCP server\n")
+				os.Exit(1)
+			}
 			if err := server.ServeStdio(mcpServer); err != nil {
 				fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 				os.Exit(1)

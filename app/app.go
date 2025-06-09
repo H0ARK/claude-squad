@@ -4,17 +4,20 @@ import (
 	"claude-squad/config"
 	"claude-squad/keys"
 	"claude-squad/log"
+	"claude-squad/mcp"
 	"claude-squad/session"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 const GlobalInstanceLimit = 10
@@ -29,6 +32,37 @@ func Run(ctx context.Context, program string, autoYes bool) error {
 	_, err := p.Run()
 	return err
 }
+
+// RunWithMCP runs the application with both UI and MCP server over SSE
+func RunWithMCP(ctx context.Context, program string, autoYes bool) error {
+	// Start MCP server over HTTP/SSE in a goroutine
+	go func() {
+		mcpServer := mcp.CreateMCPServer()
+		if mcpServer == nil {
+			log.ErrorLog.Printf("Failed to create MCP server")
+			return
+		}
+		
+		// Create SSE server
+		sseServer := server.NewSSEServer(mcpServer)
+		
+		// Set up HTTP server for SSE transport
+		mux := http.NewServeMux()
+		mux.Handle("/sse", sseServer.SSEHandler())
+		mux.Handle("/message", sseServer.MessageHandler())
+		
+		log.InfoLog.Printf("Starting MCP server on http://localhost:8080")
+		log.InfoLog.Printf("SSE endpoint: http://localhost:8080/sse")
+		log.InfoLog.Printf("Message endpoint: http://localhost:8080/message")
+		if err := http.ListenAndServe(":8080", mux); err != nil {
+			log.ErrorLog.Printf("MCP server error: %v", err)
+		}
+	}()
+
+	// Run the UI in the main thread
+	return Run(ctx, program, autoYes)
+}
+
 
 type state int
 
