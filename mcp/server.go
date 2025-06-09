@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"claude-squad/log"
 	"claude-squad/session"
 	"context"
 	"fmt"
@@ -15,23 +16,24 @@ import (
 
 // Agent management types
 type AgentInfo struct {
-	ID         string             `json:"id"`
-	SessionID  string             `json:"session_id"`
-	Task       string             `json:"task,omitempty"`
-	Status     string             `json:"status"`
-	CreatedAt  time.Time          `json:"created_at"`
-	LastActive time.Time          `json:"last_active"`
-	Instance   *session.Instance  `json:"-"` // Reference to claude-squad instance
+	ID         string    `json:"id"`
+	SessionID  string    `json:"session_id"`
+	Task       string    `json:"task,omitempty"`
+	Status     string    `json:"status"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastActive time.Time `json:"last_active"`
 }
 
 type AgentManager struct {
-	agents map[string]AgentInfo
-	mu     sync.RWMutex
+	agents   map[string]AgentInfo
+	instances map[string]*session.Instance
+	mu      sync.RWMutex
 }
 
 func NewAgentManager() *AgentManager {
 	return &AgentManager{
-		agents: make(map[string]AgentInfo),
+		agents:   make(map[string]AgentInfo),
+		instances: make(map[string]*session.Instance),
 	}
 }
 
@@ -192,6 +194,16 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 		return "", fmt.Errorf("failed to start instance: %w", err)
 	}
 
+	// Send the initial task as a prompt to the agent
+	if task != "" {
+		if err := instance.SendPrompt(task); err != nil {
+			log.ErrorLog.Printf("Failed to send initial prompt to agent %s: %v", agentID, err)
+			instance.Kill()
+			return "", fmt.Errorf("failed to send initial prompt to agent %s: %w", agentID, err)
+		}
+		log.InfoLog.Printf("Sent initial prompt to agent %s: %s", agentID, task)
+	}
+
 	// Store agent info
 	am.mu.Lock()
 	am.agents[agentID] = AgentInfo{
@@ -201,8 +213,8 @@ func (am *AgentManager) launchAgent(task, program string) (string, error) {
 		Status:     "active",
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
-		Instance:   instance,
 	}
+	am.instances[agentID] = instance
 	am.mu.Unlock()
 
 	return fmt.Sprintf("Agent %s launched successfully as claude-squad instance '%s' with task: %s", agentID, title, task), nil
@@ -243,18 +255,19 @@ func (am *AgentManager) sendMessage(agentID, message string) (string, error) {
 		return "", fmt.Errorf("agent %s not found", agentID)
 	}
 
-	if agent.Instance == nil {
+	instance, ok := am.instances[agentID]
+	if !ok {
 		return "", fmt.Errorf("agent %s has no instance", agentID)
 	}
 
 	// Send message using claude-squad instance tmux session (two-step: text first, then enter)
 	// Access the tmux session directly from the instance
-	if !agent.Instance.Started() {
+	if !instance.Started() {
 		return "", fmt.Errorf("agent %s instance not started", agentID)
 	}
 
 	// Use the instance title as the session name (claude-squad uses title for tmux session names)
-	sessionName := fmt.Sprintf("claudesquad_%s", strings.ReplaceAll(agent.Instance.Title, " ", ""))
+	sessionName := fmt.Sprintf("claudesquad_%s", strings.ReplaceAll(instance.Title, " ", ""))
 
 	cmd1 := exec.Command("tmux", "send-keys", "-t", sessionName, message)
 	if err := cmd1.Run(); err != nil {
