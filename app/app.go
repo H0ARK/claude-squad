@@ -280,31 +280,25 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 
 func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	// If an overlay is active, it should be the only thing that can be updated.
-	if m.textInputOverlay != nil && m.textInputOverlay.Active() {
-		switch msg.String() {
-		case "enter":
-			return m.handleNewInstanceSubmit()
-		case "ctrl+c", "esc":
-			m.list.KillLast()
-			m.textInputOverlay = nil
-			m.state = stateDefault
-			m.menu.SetState(ui.StateDefault)
-			return m, m.instanceChanged()
-		default:
-			var cmd tea.Cmd
-			*m.textInputOverlay, cmd = m.textInputOverlay.Update(msg)
-			return m, cmd
-		}
-	}
-	if m.textOverlay != nil && m.textOverlay.Active() {
-		switch msg.String() {
-		case "enter", "q", "esc":
-			m.textOverlay.Close()
-			if m.textOverlay.OnClose != nil {
-				m.textOverlay.OnClose()
+	if m.textInputOverlay != nil && !m.textInputOverlay.IsSubmitted() && !m.textInputOverlay.IsCanceled() {
+		shouldClose := m.textInputOverlay.HandleKeyPress(msg)
+		if shouldClose {
+			if m.textInputOverlay.IsCanceled() {
+				// Handle cancellation
+				m.list.Kill()
+				m.textInputOverlay = nil
+				m.state = stateDefault
+				m.menu.SetState(ui.StateDefault)
+				return m, m.instanceChanged()
+			} else if m.textInputOverlay.IsSubmitted() {
+				// Handle submission
+				return m.handleNewInstanceSubmit()
 			}
 		}
 		return m, nil
+	}
+	if m.textOverlay != nil && !m.textOverlay.Dismissed {
+		return m.handleHelpState(msg)
 	}
 
 	cmd, returnEarly := m.handleMenuHighlighting(msg)
@@ -324,7 +318,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	// Key presses handled by the list component
 	if m.list.GetSelectedInstance() != nil && m.list.GetSelectedInstance().Paused() {
 		// If paused, only allow a subset of keys
-		switch keys.Keymap[msg.String()] {
+		switch keys.GlobalKeyStringsMap[msg.String()] {
 		case keys.KeyResume, keys.KeyKill, keys.KeyUp, keys.KeyDown, keys.KeyHelp, keys.KeyQuit:
 			// Allow these keys
 		default:
@@ -332,10 +326,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 	}
 
-	switch keys.Keymap[msg.String()] {
+	switch keys.GlobalKeyStringsMap[msg.String()] {
 	case keys.KeyHelp:
-		m.showHelpScreen(helpTypeGlobal, nil)
-		return m, nil
+		return m.showHelpScreen(helpTypeGeneral, nil)
 	case keys.KeyPrompt:
 		return m.handleNewInstance(true)
 	case keys.KeyNew:
@@ -412,13 +405,12 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 
 		// Show help screen before pausing
-		m.showHelpScreen(helpTypeInstanceCheckout, func() {
+		return m.showHelpScreen(helpTypeInstanceCheckout, func() {
 			if err := selected.Pause(); err != nil {
 				m.handleError(err)
 			}
 			m.instanceChanged()
 		})
-		return m, nil
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil {
@@ -437,7 +429,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		// Show help screen before attaching
-		m.showHelpScreen(helpTypeInstanceAttach, func() {
+		return m.showHelpScreen(helpTypeInstanceAttach, func() {
 			ch, err := m.list.Attach()
 			if err != nil {
 				m.handleError(err)
@@ -446,7 +438,6 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			<-ch
 			m.state = stateDefault
 		})
-		return m, nil
 	default:
 		return m, nil
 	}
@@ -463,7 +454,7 @@ func (m *home) handleNewInstanceSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	inputValue := m.textInputOverlay.Value()
+	inputValue := m.textInputOverlay.GetValue()
 	parts := strings.SplitN(inputValue, "--", 2)
 	title := strings.TrimSpace(parts[0])
 	var flags []string
@@ -487,8 +478,7 @@ func (m *home) handleNewInstanceSubmit() (tea.Model, tea.Cmd) {
 		m.state = statePrompt
 		m.menu.SetState(ui.StatePrompt)
 		m.promptAfterName = false
-		m.textInputOverlay = overlay.NewTextInput("Enter prompt...", "")
-		m.textInputOverlay.Focus()
+		m.textInputOverlay = overlay.NewTextInputOverlay("Enter prompt...", "")
 	} else {
 		m.state = stateDefault
 		m.menu.SetState(ui.StateDefault)
@@ -517,8 +507,7 @@ func (m *home) handleNewInstance(prompt bool) (tea.Model, tea.Cmd) {
 	m.menu.SetState(ui.StateNewInstance)
 	m.promptAfterName = prompt
 
-	m.textInputOverlay = overlay.NewTextInput("Enter name for new session...", "")
-	m.textInputOverlay.Focus()
+	m.textInputOverlay = overlay.NewTextInputOverlay("Enter name for new session...", "")
 
 	return m, nil
 }
