@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -65,7 +66,35 @@ var (
 
 			if mcpFlag {
 				log.Initialize(true) // Enable logging for MCP mode
-				return app.RunWithMCP(ctx, program, autoYes)
+				
+				// Start only HTTP/SSE MCP server (no UI due to stdio conflicts)
+				mcpServer := mcp.CreateMCPServer()
+				if mcpServer == nil {
+					return fmt.Errorf("failed to create MCP server")
+				}
+				
+				// Create SSE server
+				sseServer := server.NewSSEServer(mcpServer)
+				
+				// Set up HTTP server for SSE transport
+				mux := http.NewServeMux()
+				mux.Handle("/sse", sseServer.SSEHandler())
+				mux.Handle("/message", sseServer.MessageHandler())
+				
+				// Add a health check endpoint
+				mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte("MCP Server OK"))
+				})
+				
+				fmt.Printf("🚀 Claude Squad MCP Server (HTTP/SSE Mode)\n")
+				fmt.Printf("   MCP Server: http://localhost:8080\n") 
+				fmt.Printf("   SSE endpoint: http://localhost:8080/sse\n")
+				fmt.Printf("   Message endpoint: http://localhost:8080/message\n")
+				fmt.Printf("   Health check: http://localhost:8080/health\n")
+				fmt.Printf("   Run 'claude-squad' in another terminal for UI\n\n")
+				
+				return http.ListenAndServe(":8080", mux)
 			}
 			if autoYes {
 				defer func() {

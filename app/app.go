@@ -35,29 +35,41 @@ func Run(ctx context.Context, program string, autoYes bool) error {
 
 // RunWithMCP runs the application with both UI and MCP server over SSE
 func RunWithMCP(ctx context.Context, program string, autoYes bool) error {
-	// Start MCP server over HTTP/SSE in a goroutine
+	mcpServer := mcp.CreateMCPServer()
+	if mcpServer == nil {
+		return fmt.Errorf("failed to create MCP server")
+	}
+	
+	// Create SSE server
+	sseServer := server.NewSSEServer(mcpServer)
+	
+	// Set up HTTP server for SSE transport
+	mux := http.NewServeMux()
+	mux.Handle("/sse", sseServer.SSEHandler())
+	mux.Handle("/message", sseServer.MessageHandler())
+	
+	// Add a health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("MCP Server OK"))
+	})
+	
+	fmt.Printf("🚀 Claude Squad MCP Mode\n")
+	fmt.Printf("   UI available with session management\n")
+	fmt.Printf("   MCP Server: http://localhost:8080\n")
+	fmt.Printf("   SSE endpoint: http://localhost:8080/sse\n")
+	fmt.Printf("   Message endpoint: http://localhost:8080/message\n")
+	fmt.Printf("   Health check: http://localhost:8080/health\n\n")
+	
+	// Start HTTP server in a goroutine
 	go func() {
-		mcpServer := mcp.CreateMCPServer()
-		if mcpServer == nil {
-			log.ErrorLog.Printf("Failed to create MCP server")
-			return
-		}
-		
-		// Create SSE server
-		sseServer := server.NewSSEServer(mcpServer)
-		
-		// Set up HTTP server for SSE transport
-		mux := http.NewServeMux()
-		mux.Handle("/sse", sseServer.SSEHandler())
-		mux.Handle("/message", sseServer.MessageHandler())
-		
-		log.InfoLog.Printf("Starting MCP server on http://localhost:8080")
-		log.InfoLog.Printf("SSE endpoint: http://localhost:8080/sse")
-		log.InfoLog.Printf("Message endpoint: http://localhost:8080/message")
 		if err := http.ListenAndServe(":8080", mux); err != nil {
 			log.ErrorLog.Printf("MCP server error: %v", err)
 		}
 	}()
+	
+	// Give the HTTP server a moment to start
+	time.Sleep(200 * time.Millisecond)
 
 	// Run the UI in the main thread
 	return Run(ctx, program, autoYes)
