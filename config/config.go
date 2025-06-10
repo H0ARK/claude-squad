@@ -32,8 +32,8 @@ type Config struct {
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		DefaultProgram:     "claude --dangerously-skip-permissions",
-		AutoYes:            false,
+		DefaultProgram:     "claude mcp add claude-squad /Users/conrad/.local/bin/cs -- --mcp",
+		AutoYes:            true,
 		DaemonPollInterval: 1000,
 	}
 }
