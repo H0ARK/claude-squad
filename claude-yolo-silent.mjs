@@ -331,7 +331,7 @@ setTimeout(() => {
 
   // Add MCP configuration for HIVE if we're in coordinator mode
   if (hiveCoordinator && !process.argv.includes("--mcp-config")) {
-    const mcpConfigPath = path.join(__dirname, "claude-mcp-config.json");
+    const mcpConfigPath = path.join(__dirname, "mcp.json");
     if (fs.existsSync(mcpConfigPath)) {
       process.argv.splice(2, 0, "--mcp-config", mcpConfigPath);
       debug("Added HIVE MCP configuration to command line arguments");

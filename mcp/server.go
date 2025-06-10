@@ -360,7 +360,7 @@ func (am *AgentManager) launchAgent(task, agentType, program string, interactive
 		// Default to standard claude
 		actualProgram = "node /Users/conrad/Documents/github/claude-squad/claude-yolo-silent.mjs"
 		systemPrompt = ""
-		finalAgentType = "claude-yolo"
+		finalAgentType = "claude --dangerously-skip-permissions"
 	}
 	
 	log.InfoLog.Printf("Creating agent %s (type: %s) with program '%s'", agentID, finalAgentType, actualProgram)

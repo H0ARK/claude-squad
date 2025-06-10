@@ -32,7 +32,7 @@ type Config struct {
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		DefaultProgram:     "claude",
+		DefaultProgram:     "claude --dangerously-skip-permissions",
 		AutoYes:            false,
 		DaemonPollInterval: 1000,
 	}

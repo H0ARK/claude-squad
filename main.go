@@ -40,7 +40,29 @@ var (
 				return err
 			}
 
-			// Check if we're in a git repository
+			if mcpFlag {
+				// MCP mode doesn't require git repository - set current directory as root
+				currentDir, err := filepath.Abs(".")
+				if err != nil {
+					return fmt.Errorf("failed to get current directory: %w", err)
+				}
+				config.SetRootDirectory(currentDir)
+				
+				// For now, keep the original stdio MCP server approach
+				// Agents created will show up in any claude-squad UI via shared storage
+				log.Initialize(true) // Enable logging for MCP mode
+				fmt.Fprintf(os.Stderr, "🚀 Claude Squad MCP Server (stdio mode)\n")
+				fmt.Fprintf(os.Stderr, "   Agents created will appear in claude-squad UI\n")
+				fmt.Fprintf(os.Stderr, "   Run 'claude-squad' in another terminal for UI\n\n")
+				
+				mcpServer := mcp.CreateMCPServer()
+				if mcpServer == nil {
+					return fmt.Errorf("failed to create MCP server")
+				}
+				return server.ServeStdio(mcpServer)
+			}
+
+			// Check if we're in a git repository (only for non-MCP mode)
 			currentDir, err := filepath.Abs(".")
 			if err != nil {
 				return fmt.Errorf("failed to get current directory: %w", err)
@@ -64,21 +86,6 @@ var (
 			autoYes := cfg.AutoYes
 			if autoYesFlag {
 				autoYes = true
-			}
-
-			if mcpFlag {
-				// For now, keep the original stdio MCP server approach
-				// Agents created will show up in any claude-squad UI via shared storage
-				log.Initialize(true) // Enable logging for MCP mode
-				fmt.Fprintf(os.Stderr, "🚀 Claude Squad MCP Server (stdio mode)\n")
-				fmt.Fprintf(os.Stderr, "   Agents created will appear in claude-squad UI\n")
-				fmt.Fprintf(os.Stderr, "   Run 'claude-squad' in another terminal for UI\n\n")
-				
-				mcpServer := mcp.CreateMCPServer()
-				if mcpServer == nil {
-					return fmt.Errorf("failed to create MCP server")
-				}
-				return server.ServeStdio(mcpServer)
 			}
 			if autoYes {
 				defer func() {

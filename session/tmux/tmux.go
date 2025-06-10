@@ -103,7 +103,8 @@ func (t *TmuxSession) Start(program string, workDir string) error {
 
 	// We need to close the ptmx, but we shouldn't close it before the command above finishes.
 	// So, we poll for completion before closing.
-	timeout := time.After(2 * time.Second)
+	// Increased timeout to 10 seconds for slow-starting programs like claude-yolo-silent.mjs
+	timeout := time.After(10 * time.Second)
 	for !DoesSessionExist(t.sanitizedName) {
 		select {
 		case <-timeout:
